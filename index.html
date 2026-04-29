@@ -1,0 +1,1658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="Home loan explorer with prepayment simulation" />
+<title>Home Loan Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; margin: 0; }
+  .loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #64748b; font-size: 0.875rem; }
+</style>
+</head>
+<body>
+<div id="root"><div class="loading">Loading dashboard…</div></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useMemo, useEffect } from 'https://esm.sh/react@18.3.1';
+import ReactDOM from 'https://esm.sh/react-dom@18.3.1/client';
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid,
+  Tooltip, Legend, ResponsiveContainer
+} from 'https://esm.sh/recharts@2.13.0?deps=react@18.3.1,react-dom@18.3.1';
+import {
+  Home, RotateCcw, Plus, Trash2, TrendingDown, Calendar,
+  ChevronDown, ChevronUp, Zap, Check, Wallet, Target, Pin, Activity, Pencil, Cloud, X
+} from 'https://esm.sh/lucide-react@0.460.0?deps=react@18.3.1';
+
+// ============ UTILITIES ============
+const formatINR = (num, opts = {}) => {
+  const { compact = false, showSymbol = true } = opts;
+  if (num === null || num === undefined || isNaN(num)) return '—';
+  const abs = Math.abs(num);
+  const sign = num < 0 ? '-' : '';
+  const sym = showSymbol ? '₹' : '';
+
+  if (compact) {
+    if (abs >= 10000000) return `${sign}${sym}${(abs / 10000000).toFixed(2)}Cr`;
+    if (abs >= 100000) return `${sign}${sym}${(abs / 100000).toFixed(2)}L`;
+    if (abs >= 1000) return `${sign}${sym}${(abs / 1000).toFixed(1)}K`;
+    return `${sign}${sym}${Math.round(abs)}`;
+  }
+
+  const s = Math.round(abs).toString();
+  let formatted;
+  if (s.length <= 3) formatted = s;
+  else {
+    const lastThree = s.slice(-3);
+    const rest = s.slice(0, -3);
+    formatted = rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',') + ',' + lastThree;
+  }
+  return `${sign}${sym}${formatted}`;
+};
+
+const addMonths = (d, n) => {
+  const r = new Date(d);
+  r.setMonth(r.getMonth() + n);
+  return r;
+};
+const fmtMY = (d) => d.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+const fmtShortMY = (d) => d.toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
+const fmtFullDate = (d) => d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+
+// Always-in-Lakhs, no decimals — for tight comparisons (year-end balances)
+const fmtL = (num) => {
+  if (num === null || num === undefined || isNaN(num)) return '—';
+  const abs = Math.abs(num);
+  if (abs < 1000) return '₹0';
+  if (abs < 100000) return `₹${Math.round(abs / 1000)}K`;
+  return `${num < 0 ? '-' : ''}₹${Math.round(abs / 100000)}L`;
+};
+
+// ============ STATIC LOAN DATA ============
+const ORIG = {
+  loanAmount: 11366000,
+  paidPrincipal: 4844453,
+  paidInterest: 2894885,
+  paidTotal: 7739338,
+  outstandingPrincipal: 6522741,
+  totalTenure: 124,
+  monthsPaid: 41,
+  remainingTenure: 83,
+  currentEMI: 102408,
+  agreementDate: new Date(2022, 1, 17),
+  firstEMIDate: new Date(2022, 11, 10),
+  maturityDate: new Date(2033, 2, 10),
+  snapshotNextDue: new Date(2026, 4, 10),
+  inferredRate: 7.95
+};
+
+// ============ AMORTIZATION ENGINE ============
+function computeSchedule({
+  startBalance, annualRate, initialEMI,
+  prepayments = [], prepayMode = 'reduce_tenure',
+  originalRemainingMonths
+}) {
+  const schedule = [];
+  let balance = startBalance;
+  let currentEMI = initialEMI;
+  const monthlyRate = annualRate / 12 / 100;
+  let month = 0;
+  const MAX = 600;
+
+  const prepayByMonth = {};
+  prepayments.forEach(p => {
+    if (p.month >= 1 && p.amount > 0) {
+      prepayByMonth[p.month] = (prepayByMonth[p.month] || 0) + p.amount;
+    }
+  });
+
+  let totalInterest = 0, totalPrepay = 0, totalEMI = 0;
+
+  while (balance > 0.5 && month < MAX) {
+    month++;
+    const interest = balance * monthlyRate;
+    let principalPaid = currentEMI - interest;
+    if (principalPaid > balance) principalPaid = balance;
+    if (principalPaid < 0) principalPaid = 0;
+
+    const actualEMI = principalPaid + interest;
+    balance -= principalPaid;
+    totalInterest += interest;
+    totalEMI += actualEMI;
+
+    let prepayAmount = 0;
+    if (prepayByMonth[month] && balance > 0.01) {
+      prepayAmount = Math.min(prepayByMonth[month], balance);
+      balance -= prepayAmount;
+      totalPrepay += prepayAmount;
+
+      if (prepayMode === 'reduce_emi' && balance > 1 && originalRemainingMonths) {
+        const left = originalRemainingMonths - month;
+        if (left > 0) {
+          const r = monthlyRate, n = left;
+          currentEMI = r === 0
+            ? balance / n
+            : balance * r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1);
+        }
+      }
+    }
+
+    schedule.push({
+      month,
+      emi: actualEMI, currentEMI, interest,
+      principal: principalPaid, prepayment: prepayAmount,
+      balance: Math.max(0, balance)
+    });
+
+    if (balance < 0.5) break;
+  }
+
+  return {
+    schedule, totalInterest, totalPrepay, totalEMI,
+    totalOutflow: totalEMI + totalPrepay,
+    finalMonth: month
+  };
+}
+
+// ============ AUTO-DEDUCTION ON 10TH ============
+function getAutoState() {
+  const today = new Date();
+  const monthlyRate = ORIG.inferredRate / 12 / 100;
+
+  // Count EMI dates (snapshotNextDue is the first; next on the 10th of each subsequent month)
+  let count = 0;
+  let cursor = new Date(ORIG.snapshotNextDue);
+  while (cursor.getTime() <= today.getTime()) {
+    count++;
+    cursor = addMonths(cursor, 1);
+  }
+  // cursor is now the *next future* EMI date
+
+  let outstanding = ORIG.outstandingPrincipal;
+  let paidPrincipal = ORIG.paidPrincipal;
+  let paidInterest = ORIG.paidInterest;
+
+  for (let i = 0; i < count; i++) {
+    if (outstanding <= 0.5) break;
+    const interest = outstanding * monthlyRate;
+    let principal = Math.min(ORIG.currentEMI - interest, outstanding);
+    if (principal < 0) principal = 0;
+    outstanding -= principal;
+    paidPrincipal += principal;
+    paidInterest += interest;
+  }
+
+  return {
+    autoCount: count,
+    today,
+    firstFutureDate: cursor,
+    outstanding,
+    paidPrincipal,
+    paidInterest,
+    paidTotal: paidPrincipal + paidInterest,
+    monthsPaid: ORIG.monthsPaid + count,
+    remainingTenure: Math.max(0, ORIG.remainingTenure - count)
+  };
+}
+
+// ============ MAIN COMPONENT ============
+const Dashboard = () => {
+  const autoState = useMemo(() => getAutoState(), []);
+  const today = autoState.today;
+  const firstFutureDate = autoState.firstFutureDate;
+
+  const monthToLabel = (m, full = false) => {
+    const d = addMonths(firstFutureDate, m - 1);
+    return d.toLocaleDateString('en-IN', full
+      ? { month: 'short', year: 'numeric' }
+      : { month: 'short', year: '2-digit' });
+  };
+  const monthToDate = (m) => addMonths(firstFutureDate, m - 1);
+
+  // Editable state (defaults from autoState)
+  const [outstanding, setOutstanding] = useState(autoState.outstanding);
+  const [annualRate, setAnnualRate] = useState(ORIG.inferredRate);
+  const [emi, setEmi] = useState(ORIG.currentEMI);
+  const [remainingMonths, setRemainingMonths] = useState(autoState.remainingTenure);
+  const [prepayMode, setPrepayMode] = useState('reduce_tenure');
+  const [prepayments, setPrepayments] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [showTable, setShowTable] = useState(false);
+  const [tableView, setTableView] = useState('monthly'); // monthly default
+
+  // ===== Cloud sync via GitHub Gist =====
+  const GIST_FILENAME = 'loan_dashboard.json';
+  const GIST_STORAGE_KEY = 'loan_dashboard_gist_config';
+  const [gistConfig, setGistConfig] = useState(() => {
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(GIST_STORAGE_KEY) : null;
+      return saved ? JSON.parse(saved) : { gistId: '', token: '', autoSave: false };
+    } catch { return { gistId: '', token: '', autoSave: false }; }
+  });
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | synced | error
+  const [lastSync, setLastSync] = useState(null);
+  const [showSync, setShowSync] = useState(false);
+  const [syncMessage, setSyncMessage] = useState('');
+  const [hasPulled, setHasPulled] = useState(false);
+
+  const [prepForm, setPrepForm] = useState({
+    type: 'one_time',
+    amount: 200000,
+    month: 1,
+    frequency: 12,
+    startMonth: 12,
+    endMonth: 0,
+    applied: false
+  });
+
+  // Month dropdown options
+  const monthOptions = useMemo(() => {
+    const opts = [];
+    for (let i = 1; i <= 200; i++) opts.push({ value: i, label: monthToLabel(i, true) });
+    return opts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firstFutureDate]);
+
+  // Applied prepayments (one-time + flagged) reduce outstanding for sim and bump paid totals
+  const appliedSum = useMemo(() => prepayments
+    .filter(p => p.applied && p.type === 'one_time')
+    .reduce((s, p) => s + parseFloat(p.amount || 0), 0),
+    [prepayments]);
+
+  const adjusted = {
+    outstanding: outstanding - appliedSum,
+    paidPrincipal: autoState.paidPrincipal + appliedSum + (autoState.outstanding - outstanding),
+    paidInterest: autoState.paidInterest,
+    monthsPaid: autoState.monthsPaid
+  };
+  adjusted.paidTotal = adjusted.paidPrincipal + adjusted.paidInterest;
+
+  // Future prepayments (skip applied one-time)
+  const futurePrepayments = useMemo(() => {
+    const list = [];
+    prepayments.forEach(p => {
+      if (p.applied && p.type === 'one_time') return;
+      if (p.type === 'one_time') {
+        list.push({ month: parseInt(p.month), amount: parseFloat(p.amount) });
+      } else {
+        const end = p.endMonth && parseInt(p.endMonth) > 0 ? parseInt(p.endMonth) : 200;
+        for (let m = parseInt(p.startMonth); m <= end; m += parseInt(p.frequency)) {
+          list.push({ month: m, amount: parseFloat(p.amount) });
+        }
+      }
+    });
+    return list;
+  }, [prepayments]);
+
+  const baseline = useMemo(() => computeSchedule({
+    startBalance: adjusted.outstanding,
+    annualRate,
+    initialEMI: emi
+  }), [adjusted.outstanding, annualRate, emi]);
+
+  const optimized = useMemo(() => computeSchedule({
+    startBalance: adjusted.outstanding,
+    annualRate,
+    initialEMI: emi,
+    prepayments: futurePrepayments,
+    prepayMode,
+    originalRemainingMonths: remainingMonths
+  }), [adjusted.outstanding, annualRate, emi, futurePrepayments, prepayMode, remainingMonths]);
+
+  const interestSaved = baseline.totalInterest - optimized.totalInterest;
+  const monthsSaved = baseline.finalMonth - optimized.finalMonth;
+  const yearsSaved = (monthsSaved / 12).toFixed(1);
+
+  // Progress metrics — Current (actual, vs original loan plan)
+  const interestTotalCurrent = autoState.paidInterest + baseline.totalInterest;
+  const cur = {
+    monthsPct: (autoState.monthsPaid / ORIG.totalTenure) * 100,
+    monthsLabel: `${autoState.monthsPaid} of ${ORIG.totalTenure}`,
+    principalPct: (autoState.paidPrincipal / ORIG.loanAmount) * 100,
+    principalLabel: `${formatINR(autoState.paidPrincipal, { compact: true })} of ${formatINR(ORIG.loanAmount, { compact: true })}`,
+    interestPct: interestTotalCurrent > 0 ? (autoState.paidInterest / interestTotalCurrent) * 100 : 0,
+    interestLabel: `${formatINR(autoState.paidInterest, { compact: true })} of ${formatINR(interestTotalCurrent, { compact: true })}`
+  };
+
+  // Progress metrics — Simulated (with all prepayments applied + future plan)
+  const simEffectiveTotal = autoState.monthsPaid + optimized.finalMonth;
+  const interestTotalSim = autoState.paidInterest + optimized.totalInterest;
+  const sim = {
+    monthsPct: simEffectiveTotal > 0 ? (autoState.monthsPaid / simEffectiveTotal) * 100 : 0,
+    monthsLabel: `${autoState.monthsPaid} of ${simEffectiveTotal}`,
+    principalPct: (adjusted.paidPrincipal / ORIG.loanAmount) * 100,
+    principalLabel: `${formatINR(adjusted.paidPrincipal, { compact: true })} of ${formatINR(ORIG.loanAmount, { compact: true })}`,
+    interestPct: interestTotalSim > 0 ? (autoState.paidInterest / interestTotalSim) * 100 : 0,
+    interestLabel: `${formatINR(autoState.paidInterest, { compact: true })} of ${formatINR(interestTotalSim, { compact: true })}`
+  };
+
+  const baselineEndDate = baseline.finalMonth > 0 ? monthToDate(baseline.finalMonth) : firstFutureDate;
+  const optimizedEndDate = optimized.finalMonth > 0 ? monthToDate(optimized.finalMonth) : firstFutureDate;
+
+  // Year-end markers — Original (formula-based, hypothetical regular EMIs)
+  const originalYearMarkers = useMemo(() => {
+    const compute = (date) => {
+      const m = (date.getFullYear() - ORIG.firstEMIDate.getFullYear()) * 12 +
+                (date.getMonth() - ORIG.firstEMIDate.getMonth());
+      if (m <= 0) return ORIG.loanAmount;
+      if (m >= ORIG.totalTenure) return 0;
+      const r = ORIG.inferredRate / 12 / 100;
+      const rPow = Math.pow(1 + r, m);
+      return Math.max(0, ORIG.loanAmount * rPow - ORIG.currentEMI * (rPow - 1) / r);
+    };
+    const out = [];
+    const startY = ORIG.firstEMIDate.getFullYear() + 1;
+    const endY = ORIG.maturityDate.getFullYear() + 1;
+    for (let y = startY; y <= endY; y++) {
+      const date = new Date(y, 0, 1); // Jan 1 = end of previous calendar year
+      if (date >= ORIG.firstEMIDate && date <= ORIG.maturityDate) {
+        out.push({ date, year: y - 1, balance: compute(date) });
+      }
+    }
+    return out;
+  }, []);
+
+  // Year-end markers — Simulated (interpolate past, schedule for future)
+  const simulatedYearMarkers = useMemo(() => {
+    const compute = (date) => {
+      if (date <= ORIG.firstEMIDate) return ORIG.loanAmount;
+      if (date <= today) {
+        // Linear interpolate past from start to today
+        const totalMs = today.getTime() - ORIG.firstEMIDate.getTime();
+        const elapsedMs = date.getTime() - ORIG.firstEMIDate.getTime();
+        const ratio = totalMs > 0 ? elapsedMs / totalMs : 0;
+        return Math.max(0, ORIG.loanAmount - ratio * (ORIG.loanAmount - adjusted.outstanding));
+      }
+      // Future from optimized schedule
+      const monthsAhead = (date.getFullYear() - firstFutureDate.getFullYear()) * 12 +
+                         (date.getMonth() - firstFutureDate.getMonth());
+      // Jan 1 of year Y is *after* Dec 10 of year Y-1 EMI but *before* Jan 10 of year Y EMI
+      // schedule[i] = balance after EMI #(i+1), so we want index = monthsAhead - 1
+      const idx = monthsAhead - 1;
+      if (idx < 0) return adjusted.outstanding;
+      if (idx >= optimized.schedule.length) return 0;
+      return optimized.schedule[idx].balance;
+    };
+    const out = [];
+    const startY = ORIG.firstEMIDate.getFullYear() + 1;
+    const endY = optimizedEndDate.getFullYear() + 1;
+    for (let y = startY; y <= endY; y++) {
+      const date = new Date(y, 0, 1);
+      if (date >= ORIG.firstEMIDate && date <= optimizedEndDate) {
+        out.push({ date, year: y - 1, balance: compute(date) });
+      }
+    }
+    return out;
+  }, [today, adjusted.outstanding, firstFutureDate, optimized, optimizedEndDate]);
+
+  // Per-prepayment balance after info
+  const getPrepayDetails = (p) => {
+    if (p.type === 'one_time' && p.applied) {
+      return { label: 'Outstanding now', value: formatINR(adjusted.outstanding, { compact: true }), tone: 'paid' };
+    }
+    if (p.type === 'one_time') {
+      const row = optimized.schedule.find(r => r.month === parseInt(p.month));
+      return row
+        ? { label: 'Will leave', value: formatINR(row.balance, { compact: true }), tone: 'future' }
+        : { label: '—', value: '—', tone: 'future' };
+    }
+    // Recurring: count occurrences within optimized schedule
+    const start = parseInt(p.startMonth);
+    const freq = parseInt(p.frequency);
+    const cap = p.endMonth && parseInt(p.endMonth) > 0 ? parseInt(p.endMonth) : optimized.finalMonth;
+    let count = 0;
+    for (let m = start; m <= cap && m <= optimized.finalMonth; m += freq) count++;
+    const total = parseFloat(p.amount) * count;
+    return { label: `Total (${count}×)`, value: formatINR(total, { compact: true }), tone: 'recurring' };
+  };
+
+  // Chart data
+  const balanceData = useMemo(() => {
+    const maxLen = Math.max(baseline.schedule.length, optimized.schedule.length);
+    const step = Math.max(1, Math.floor(maxLen / 60));
+    const data = [];
+    for (let i = 0; i < maxLen; i += step) {
+      const b = baseline.schedule[i];
+      const o = optimized.schedule[i];
+      data.push({
+        month: i + 1,
+        label: monthToLabel(i + 1),
+        baseline: b ? Math.round(b.balance) : 0,
+        optimized: o ? Math.round(o.balance) : 0
+      });
+    }
+    return data;
+  }, [baseline, optimized]);
+
+  // Yearly amortization rollup
+  const yearlyData = useMemo(() => {
+    const data = [];
+    for (let y = 0; y < Math.ceil(optimized.schedule.length / 12); y++) {
+      const slice = optimized.schedule.slice(y * 12, (y + 1) * 12);
+      if (!slice.length) continue;
+      data.push({
+        year: `Y${y + 1}`,
+        principal: slice.reduce((s, r) => s + r.principal, 0),
+        interest: slice.reduce((s, r) => s + r.interest, 0),
+        prepayment: slice.reduce((s, r) => s + r.prepayment, 0),
+        endBalance: slice[slice.length - 1].balance,
+        startMonth: y * 12 + 1,
+        endMonth: Math.min((y + 1) * 12, optimized.schedule.length)
+      });
+    }
+    return data;
+  }, [optimized]);
+
+  // Timeline events for the optimized journey
+  const timelineEvents = useMemo(() => {
+    const events = [];
+    // Future prepayments
+    futurePrepayments.forEach(p => {
+      events.push({
+        date: monthToDate(p.month),
+        amount: p.amount,
+        label: `${formatINR(p.amount, { compact: true })} on ${monthToLabel(p.month, true)}`
+      });
+    });
+    return events;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [futurePrepayments, firstFutureDate]);
+
+  // Actions
+  const addPrepayment = () => {
+    if (!prepForm.amount || parseFloat(prepForm.amount) <= 0) return;
+    setPrepayments([...prepayments, { ...prepForm, id: Date.now() }]);
+  };
+  const removePrepayment = (id) => setPrepayments(prepayments.filter(p => p.id !== id));
+  const updatePrepayment = (id, updates) => setPrepayments(prepayments.map(p =>
+    p.id === id ? { ...p, ...updates } : p
+  ));
+  const toggleApplied = (id) => setPrepayments(prepayments.map(p =>
+    p.id === id ? { ...p, applied: !p.applied } : p
+  ));
+  const clearPrepayments = () => setPrepayments([]);
+
+  const resetAll = () => {
+    setOutstanding(autoState.outstanding);
+    setAnnualRate(ORIG.inferredRate);
+    setEmi(ORIG.currentEMI);
+    setRemainingMonths(autoState.remainingTenure);
+    setPrepayMode('reduce_tenure');
+    setPrepayments([]);
+  };
+
+  // ===== Gist sync helpers =====
+  const saveGistConfig = (cfg) => {
+    setGistConfig(cfg);
+    try { localStorage.setItem(GIST_STORAGE_KEY, JSON.stringify(cfg)); } catch {}
+  };
+
+  const collectData = () => ({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    outstanding,
+    annualRate,
+    emi,
+    remainingMonths,
+    prepayMode,
+    prepayments
+  });
+
+  const applyData = (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (typeof data.outstanding === 'number') setOutstanding(data.outstanding);
+    if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
+    if (typeof data.emi === 'number') setEmi(data.emi);
+    if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
+    if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
+    if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
+  };
+
+  const pushToGist = async (cfg) => {
+    const c = cfg || gistConfig;
+    if (!c.gistId || !c.token) {
+      setSyncMessage('Gist ID and token required');
+      setSyncStatus('error');
+      return false;
+    }
+    setSyncStatus('syncing');
+    setSyncMessage('Saving…');
+    try {
+      const res = await fetch(`https://api.github.com/gists/${c.gistId}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `token ${c.token}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          files: { [GIST_FILENAME]: { content: JSON.stringify(collectData(), null, 2) } }
+        })
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status} — ${txt.slice(0, 80)}`);
+      }
+      setSyncStatus('synced');
+      setLastSync(new Date());
+      setSyncMessage('Saved to Gist');
+      return true;
+    } catch (e) {
+      setSyncStatus('error');
+      setSyncMessage(`Save failed: ${e.message}`);
+      return false;
+    }
+  };
+
+  const pullFromGist = async (cfg) => {
+    const c = cfg || gistConfig;
+    if (!c.gistId || !c.token) {
+      setSyncMessage('Gist ID and token required');
+      setSyncStatus('error');
+      return false;
+    }
+    setSyncStatus('syncing');
+    setSyncMessage('Loading…');
+    try {
+      const res = await fetch(`https://api.github.com/gists/${c.gistId}`, {
+        headers: {
+          'Authorization': `token ${c.token}`,
+          'Accept': 'application/vnd.github.v3+json'
+        }
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status} — ${txt.slice(0, 80)}`);
+      }
+      const gist = await res.json();
+      const fileObj = gist.files?.[GIST_FILENAME];
+      if (!fileObj) {
+        setSyncMessage(`No ${GIST_FILENAME} in Gist yet — push first`);
+        setSyncStatus('idle');
+        return false;
+      }
+      const content = fileObj.content || '{}';
+      const data = JSON.parse(content);
+      if (!data || Object.keys(data).length === 0) {
+        setSyncMessage('Gist is empty — push first');
+        setSyncStatus('idle');
+        return false;
+      }
+      applyData(data);
+      setSyncStatus('synced');
+      setLastSync(new Date());
+      setSyncMessage(`Loaded · saved ${data.savedAt ? new Date(data.savedAt).toLocaleString() : 'unknown'}`);
+      return true;
+    } catch (e) {
+      setSyncStatus('error');
+      setSyncMessage(`Pull failed: ${e.message}`);
+      return false;
+    }
+  };
+
+  // On mount: if configured, pull once
+  useEffect(() => {
+    if (gistConfig.gistId && gistConfig.token && !hasPulled) {
+      setHasPulled(true);
+      pullFromGist(gistConfig);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-save (debounced 2s) when enabled and data changes
+  useEffect(() => {
+    if (!gistConfig.autoSave || !gistConfig.gistId || !gistConfig.token || !hasPulled) return;
+    const t = setTimeout(() => pushToGist(gistConfig), 2000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outstanding, annualRate, emi, remainingMonths, prepayMode, prepayments, gistConfig.autoSave]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900 text-sm">
+      {/* HEADER */}
+      <div className="bg-white border-b border-slate-200 px-3 md:px-6 py-2">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="bg-gradient-to-br from-blue-600 to-indigo-700 text-white p-1.5 rounded-md">
+              <Home size={15} />
+            </div>
+            <div>
+              <h1 className="text-sm md:text-base font-bold leading-tight">Home Loan Explorer</h1>
+              <p className="text-[10px] text-slate-500">
+                HF-38876546 · ₹{formatINR(ORIG.loanAmount, { compact: true, showSymbol: false })} · 124 mo · agreement {fmtFullDate(ORIG.agreementDate)} · today {fmtFullDate(today)}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowSync(true)}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium transition ${
+                gistConfig.gistId && gistConfig.token
+                  ? syncStatus === 'syncing'
+                    ? 'bg-amber-100 text-amber-800 hover:bg-amber-200'
+                    : syncStatus === 'error'
+                    ? 'bg-rose-100 text-rose-800 hover:bg-rose-200'
+                    : 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
+                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+              }`}
+              title={gistConfig.gistId ? `Sync · ${syncStatus}` : 'Set up cloud sync'}
+            >
+              <Cloud size={11} />
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                syncStatus === 'synced' ? 'bg-emerald-500'
+                : syncStatus === 'syncing' ? 'bg-amber-500 animate-pulse'
+                : syncStatus === 'error' ? 'bg-rose-500'
+                : gistConfig.gistId ? 'bg-slate-400' : 'bg-slate-300'
+              }`} />
+            </button>
+            <button onClick={resetAll} className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-md text-xs font-medium">
+              <RotateCcw size={11} /> Reset
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* STICKY LOAN PARAMETERS */}
+      <div className="sticky top-0 z-20 bg-white border-b-2 border-indigo-300 shadow-sm px-3 md:px-6 py-2">
+        <div className="max-w-7xl mx-auto flex items-center gap-x-4 gap-y-2 flex-wrap">
+          <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-indigo-600 shrink-0">
+            <Pin size={10} /> Params
+          </div>
+          <CompactInput label="Outstanding" value={outstanding} onChange={setOutstanding} step={10000} compact={formatINR(outstanding, { compact: true })} />
+          <CompactInput label="Rate %" value={annualRate} onChange={setAnnualRate} step={0.05} width="w-16" />
+          <CompactInput label="EMI" value={emi} onChange={setEmi} step={500} compact={formatINR(emi, { compact: true })} />
+          <CompactInput label="Months" value={remainingMonths} onChange={setRemainingMonths} step={1} width="w-16" />
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] font-medium text-slate-500 uppercase">Mode</span>
+            <select value={prepayMode} onChange={(e) => setPrepayMode(e.target.value)} className="text-xs px-1.5 py-1 border border-slate-200 rounded-md bg-white">
+              <option value="reduce_tenure">Reduce tenure</option>
+              <option value="reduce_emi">Reduce EMI</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto px-3 md:px-6 py-3 space-y-3">
+
+        {/* LOAN JOURNEY TIMELINE - moved to top */}
+        <div className="bg-white rounded-lg border border-slate-200 p-3">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold flex items-center gap-1.5">
+              <Activity size={14} className="text-slate-400" /> Loan Journey
+            </h2>
+            <span className="text-[10px] text-slate-400">
+              {Math.round((today.getTime() - ORIG.firstEMIDate.getTime()) / (1000 * 60 * 60 * 24 * 30.44))} months in · {fmtFullDate(today)}
+            </span>
+          </div>
+
+          <YearRuler
+            startDate={ORIG.firstEMIDate}
+            axisEndDate={new Date(Math.max(ORIG.maturityDate.getTime(), baselineEndDate.getTime(), optimizedEndDate.getTime()))}
+            today={today}
+          />
+
+          <div className="space-y-3 mt-2">
+            <Timeline
+              label="Original plan · regular EMIs only"
+              start={ORIG.firstEMIDate}
+              end={ORIG.maturityDate}
+              today={today}
+              axisStart={ORIG.firstEMIDate}
+              axisEnd={new Date(Math.max(ORIG.maturityDate.getTime(), baselineEndDate.getTime(), optimizedEndDate.getTime()))}
+              barColor="#94a3b8"
+              endLabel={fmtMY(ORIG.maturityDate)}
+              yearEnds={originalYearMarkers}
+            />
+            <Timeline
+              label="Simulated · with your prepayments"
+              start={ORIG.firstEMIDate}
+              end={optimizedEndDate}
+              today={today}
+              axisStart={ORIG.firstEMIDate}
+              axisEnd={new Date(Math.max(ORIG.maturityDate.getTime(), baselineEndDate.getTime(), optimizedEndDate.getTime()))}
+              barColor="#6366f1"
+              originalEnd={ORIG.maturityDate}
+              events={timelineEvents}
+              endLabel={fmtMY(optimizedEndDate)}
+              yearEnds={simulatedYearMarkers}
+            />
+          </div>
+
+          {monthsSaved > 0 ? (
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-2 text-[11px]">
+              <div className="bg-emerald-50 border border-emerald-200 rounded p-2">
+                <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">Time saved</div>
+                <div className="font-bold text-emerald-900">{monthsSaved} months · {yearsSaved} years</div>
+              </div>
+              <div className="bg-emerald-50 border border-emerald-200 rounded p-2">
+                <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">Interest saved</div>
+                <div className="font-bold text-emerald-900">{formatINR(interestSaved, { compact: true })}</div>
+              </div>
+              <div className="bg-indigo-50 border border-indigo-200 rounded p-2">
+                <div className="text-[9px] uppercase tracking-wider text-indigo-700 font-bold">Closes on</div>
+                <div className="font-bold text-indigo-900">{fmtFullDate(optimizedEndDate)} <span className="text-slate-500 font-normal">vs {fmtMY(ORIG.maturityDate)}</span></div>
+              </div>
+            </div>
+          ) : (
+            <p className="text-[11px] text-slate-500 italic mt-3">Add prepayments below to see the simulated path shrink.</p>
+          )}
+        </div>
+
+        {/* SNAPSHOT WITH PROGRESS BARS */}
+        <div className="bg-white rounded-lg border border-slate-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Loan Progress
+              {autoState.autoCount > 0 && (
+                <span className="ml-2 text-blue-600 normal-case font-bold">
+                  · {autoState.autoCount} EMI{autoState.autoCount > 1 ? 's' : ''} auto-deducted since {fmtMY(ORIG.snapshotNextDue)}
+                </span>
+              )}
+              {appliedSum > 0 && (
+                <span className="ml-2 text-emerald-600 normal-case font-bold">+{formatINR(appliedSum, { compact: true })} prepayments applied</span>
+              )}
+            </h2>
+            <span className="text-[10px] text-slate-400">As of {fmtFullDate(today)}</span>
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-x-4 gap-y-2 mb-3">
+            <div>
+              <h3 className="text-[10px] font-bold uppercase tracking-wider text-slate-600 mb-1.5 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+                Current · actual
+              </h3>
+              <div className="space-y-1.5">
+                <ProgressBar label="Months paid" left={cur.monthsLabel} right={`${cur.monthsPct.toFixed(1)}%`} pct={cur.monthsPct} color="bg-blue-500" changed={autoState.autoCount > 0} />
+                <ProgressBar label="Principal repaid" left={cur.principalLabel} right={`${cur.principalPct.toFixed(1)}%`} pct={cur.principalPct} color="bg-emerald-500" changed={autoState.autoCount > 0} />
+                <ProgressBar label="Interest paid" left={cur.interestLabel} right={`${cur.interestPct.toFixed(1)}%`} pct={cur.interestPct} color="bg-amber-500" />
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-[10px] font-bold uppercase tracking-wider text-indigo-600 mb-1.5 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
+                Simulated · with prepayments
+              </h3>
+              <div className="space-y-1.5">
+                <ProgressBar label="Effective time" left={sim.monthsLabel} right={`${sim.monthsPct.toFixed(1)}%`} pct={sim.monthsPct} color="bg-indigo-500" changed={simEffectiveTotal < ORIG.totalTenure} />
+                <MultiSegmentBar
+                  label="Principal repaid"
+                  total={ORIG.loanAmount}
+                  segments={[
+                    { label: 'EMI', value: autoState.paidPrincipal, color: 'bg-emerald-500' },
+                    { label: 'Prepayments', value: appliedSum + optimized.totalPrepay, color: 'bg-purple-500' }
+                  ]}
+                  changed={appliedSum > 0 || optimized.totalPrepay > 0}
+                />
+                <ProgressBar label="Interest paid" left={sim.interestLabel} right={`${sim.interestPct.toFixed(1)}%`} pct={sim.interestPct} color="bg-amber-500" changed={optimized.totalInterest < baseline.totalInterest} />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <Stat label="Already paid" value={formatINR(adjusted.paidTotal, { compact: true })} sub={`P:${formatINR(adjusted.paidPrincipal, { compact: true })} · I:${formatINR(adjusted.paidInterest, { compact: true })}`} />
+            <Stat label="Outstanding" value={formatINR(adjusted.outstanding, { compact: true })} sub={`Next EMI: ${fmtFullDate(firstFutureDate)}`} highlight={appliedSum > 0 || autoState.autoCount > 0} />
+            <Stat label="Current EMI" value={formatINR(emi, { compact: true })} sub={`@ ${annualRate}% p.a.`} />
+            <Stat label="Original maturity" value={fmtMY(ORIG.maturityDate)} sub={`${ORIG.totalTenure - adjusted.monthsPaid} months remaining`} />
+          </div>
+        </div>
+
+        {/* SIMULATION OUTPUT */}
+        <div className="bg-gradient-to-br from-indigo-50 to-blue-50 rounded-lg border border-indigo-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700 flex items-center gap-1">
+              <Zap size={11} /> Simulation Output
+            </h2>
+            <span className="text-[10px] text-indigo-600">
+              {appliedSum > 0 && <>+{formatINR(appliedSum, { compact: true })} applied · </>}
+              {futurePrepayments.length} future event{futurePrepayments.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+            <Stat label="New closing" value={fmtMY(optimizedEndDate)} sub={`${optimized.finalMonth} mo from now`} accent="indigo" />
+            <Stat label="Outstanding now" value={formatINR(adjusted.outstanding, { compact: true })} sub={appliedSum > 0 ? `after ${formatINR(appliedSum, { compact: true })} applied` : 'as of today'} accent="indigo" />
+            <Stat label="Still to pay (P+I)" value={formatINR(optimized.totalOutflow, { compact: true })} sub={`incl. ${formatINR(optimized.totalPrepay, { compact: true })} future prepay`} accent="indigo" />
+            <Stat label="Future interest" value={formatINR(optimized.totalInterest, { compact: true })} sub={interestSaved > 0 ? `↓ saves ${formatINR(interestSaved, { compact: true })}` : 'no savings yet'} accent={interestSaved > 0 ? 'emerald' : 'indigo'} />
+          </div>
+
+          <div className="bg-white/60 rounded-md border border-indigo-100 p-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
+            <Mini label="Total ever paid" value={formatINR(adjusted.paidTotal + optimized.totalOutflow, { compact: true })} sub="past + future" />
+            <Mini label="Total interest cost" value={formatINR(adjusted.paidInterest + optimized.totalInterest, { compact: true })} sub="paid + future" />
+            <Mini label="Months saved" value={monthsSaved > 0 ? `${monthsSaved}` : '0'} sub={`${yearsSaved} years`} good={monthsSaved > 0} />
+            <Mini label="Effective tenure" value={`${adjusted.monthsPaid + optimized.finalMonth} mo`} sub={`vs ${ORIG.totalTenure} planned`} good={monthsSaved > 0} />
+          </div>
+        </div>
+
+        {/* TWO COLUMNS */}
+        <div className="grid lg:grid-cols-2 gap-3">
+
+          {/* PREPAYMENTS */}
+          <div className="bg-white rounded-lg border border-slate-200 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-sm font-semibold flex items-center gap-1.5">
+                <Wallet size={14} className="text-slate-400" /> Prepayments
+              </h2>
+              {prepayments.length > 0 && (
+                <button onClick={clearPrepayments} className="text-[10px] text-rose-600 hover:underline">Clear all</button>
+              )}
+            </div>
+
+            {/* Add form */}
+            <div className="bg-slate-50 rounded-md p-2 border border-slate-100 mb-2">
+              <div className="grid grid-cols-2 gap-2 mb-1.5">
+                <SmallSelect
+                  label="Type"
+                  value={prepForm.type}
+                  onChange={(v) => setPrepForm({ ...prepForm, type: v })}
+                  options={[{ value: 'one_time', label: 'One-time' }, { value: 'recurring', label: 'Recurring' }]}
+                />
+                <SmallInput
+                  label="Amount (₹)"
+                  type="number"
+                  value={prepForm.amount}
+                  onChange={(v) => setPrepForm({ ...prepForm, amount: v })}
+                  hint={formatINR(prepForm.amount, { compact: true })}
+                />
+              </div>
+
+              {prepForm.type === 'one_time' ? (
+                <div className="grid grid-cols-2 gap-2 mb-1.5 items-end">
+                  <SmallSelect
+                    label="When"
+                    value={prepForm.month}
+                    onChange={(v) => setPrepForm({ ...prepForm, month: parseInt(v) })}
+                    options={monthOptions.slice(0, 120)}
+                  />
+                  <label className="flex items-center gap-1.5 text-[11px] text-slate-700 cursor-pointer pb-1">
+                    <input
+                      type="checkbox"
+                      checked={prepForm.applied}
+                      onChange={(e) => setPrepForm({ ...prepForm, applied: e.target.checked })}
+                      className="rounded"
+                    />
+                    Already paid
+                  </label>
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-2 mb-1.5">
+                  <SmallSelect
+                    label="Frequency"
+                    value={prepForm.frequency}
+                    onChange={(v) => setPrepForm({ ...prepForm, frequency: parseInt(v) })}
+                    options={[
+                      { value: 1, label: 'Monthly' },
+                      { value: 3, label: 'Quarterly' },
+                      { value: 6, label: 'Half-yearly' },
+                      { value: 12, label: 'Yearly' }
+                    ]}
+                  />
+                  <SmallSelect
+                    label="From"
+                    value={prepForm.startMonth}
+                    onChange={(v) => setPrepForm({ ...prepForm, startMonth: parseInt(v) })}
+                    options={monthOptions.slice(0, 120)}
+                  />
+                  <SmallSelect
+                    label="Until"
+                    value={prepForm.endMonth}
+                    onChange={(v) => setPrepForm({ ...prepForm, endMonth: parseInt(v) })}
+                    options={[{ value: 0, label: 'End of loan' }, ...monthOptions.slice(0, 120)]}
+                  />
+                </div>
+              )}
+
+              <button
+                onClick={addPrepayment}
+                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium py-1.5 rounded-sm flex items-center justify-center gap-1"
+              >
+                <Plus size={11} /> Add prepayment
+              </button>
+            </div>
+
+            {/* Active list */}
+            {prepayments.length === 0 ? (
+              <p className="text-[11px] text-slate-400 italic text-center py-3">No prepayments yet. Build one above to see the impact.</p>
+            ) : (
+              <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
+                {prepayments.map(p => (
+                  editingId === p.id ? (
+                    <PrepayEditForm
+                      key={p.id}
+                      p={p}
+                      onUpdate={(updates) => updatePrepayment(p.id, updates)}
+                      onDone={() => setEditingId(null)}
+                      monthOptions={monthOptions}
+                    />
+                  ) : (
+                    <PrepayItem
+                      key={p.id}
+                      p={p}
+                      details={getPrepayDetails(p)}
+                      onToggle={() => toggleApplied(p.id)}
+                      onRemove={() => removePrepayment(p.id)}
+                      onEdit={() => setEditingId(p.id)}
+                      monthToLabel={monthToLabel}
+                    />
+                  )
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* COMPARISON + CHART */}
+          <div className="space-y-3">
+            <div className="bg-white rounded-lg border border-slate-200 p-3">
+              <h2 className="text-sm font-semibold flex items-center gap-1.5 mb-2.5">
+                <Target size={14} className="text-slate-400" /> Without vs With Prepayments
+              </h2>
+
+              <div className="overflow-hidden rounded-md border border-slate-200">
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      <th className="text-left py-1.5 px-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500"></th>
+                      <th className="text-right py-1.5 px-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">No prepay</th>
+                      <th className="text-right py-1.5 px-2 text-[10px] font-semibold uppercase tracking-wider text-indigo-600 bg-indigo-50">With prepay</th>
+                      <th className="text-right py-1.5 px-2 text-[10px] font-semibold uppercase tracking-wider text-emerald-600 bg-emerald-50">You save</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <CompareRow label="Closes on" base={fmtMY(baselineEndDate)} opt={fmtMY(optimizedEndDate)} saved={monthsSaved > 0 ? `${monthsSaved} mo earlier` : '—'} saveGood={monthsSaved > 0} />
+                    <CompareRow label="Tenure" base={`${baseline.finalMonth} months`} opt={`${optimized.finalMonth} months`} saved={monthsSaved > 0 ? `${yearsSaved} yrs` : '—'} saveGood={monthsSaved > 0} />
+                    <CompareRow label="Total interest" base={formatINR(baseline.totalInterest, { compact: true })} opt={formatINR(optimized.totalInterest, { compact: true })} saved={interestSaved > 0 ? formatINR(interestSaved, { compact: true }) : '—'} saveGood={interestSaved > 0} />
+                    <CompareRow label="Total outflow" base={formatINR(baseline.totalOutflow, { compact: true })} opt={formatINR(optimized.totalOutflow, { compact: true })} saved={(baseline.totalOutflow - optimized.totalOutflow) > 0 ? formatINR(baseline.totalOutflow - optimized.totalOutflow, { compact: true }) : '—'} saveGood={baseline.totalOutflow > optimized.totalOutflow} />
+                  </tbody>
+                </table>
+              </div>
+
+              {monthsSaved > 0 && (
+                <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-md p-2 text-[11px] text-emerald-900">
+                  💡 Closes <b>{monthsSaved} months ({yearsSaved} yrs)</b> earlier · Saves <b>{formatINR(interestSaved, { compact: true })}</b> in interest
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-lg border border-slate-200 p-3">
+              <h2 className="text-sm font-semibold flex items-center gap-1.5 mb-1.5">
+                <TrendingDown size={14} className="text-slate-400" /> Outstanding Balance
+              </h2>
+              <div className="h-44">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={balanceData} margin={{ top: 5, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 9 }} interval="preserveStartEnd" />
+                    <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => formatINR(v, { compact: true, showSymbol: false })} />
+                    <Tooltip formatter={(v) => formatINR(v)} labelFormatter={(l) => l} contentStyle={{ fontSize: 11 }} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} />
+                    <Area type="monotone" dataKey="baseline" stroke="#94a3b8" fill="#cbd5e1" fillOpacity={0.4} name="Baseline" />
+                    <Area type="monotone" dataKey="optimized" stroke="#4f46e5" fill="#6366f1" fillOpacity={0.5} name="With prepay" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* AMORTIZATION */}
+        <div className="bg-white rounded-lg border border-slate-200 p-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold flex items-center gap-1.5">
+              <Calendar size={14} className="text-slate-400" /> Amortization Schedule
+            </h2>
+            <div className="flex gap-2">
+              <select value={tableView} onChange={(e) => setTableView(e.target.value)} className="text-[11px] border border-slate-200 rounded-sm px-1.5 py-0.5 bg-white">
+                <option value="monthly">Monthly</option>
+                <option value="yearly">Yearly</option>
+              </select>
+              <button onClick={() => setShowTable(!showTable)} className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1">
+                {showTable ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                {showTable ? 'Hide' : 'Show'}
+              </button>
+            </div>
+          </div>
+
+          {showTable && (
+            <div className="overflow-x-auto max-h-80 overflow-y-auto mt-2 border-t border-slate-100">
+              <table className="w-full text-[11px]">
+                <thead className="sticky top-0 bg-slate-50">
+                  <tr className="text-left">
+                    <th className="py-1.5 px-2 font-semibold text-slate-600">{tableView === 'yearly' ? 'Yr' : '#'}</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600">Date</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">EMI</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Interest</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Principal</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Prepay</th>
+                    <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Balance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tableView === 'monthly'
+                    ? optimized.schedule.map(r => (
+                      <tr key={r.month} className="border-b border-slate-100 hover:bg-slate-50">
+                        <td className="py-1 px-2 text-slate-500">{r.month}</td>
+                        <td className="py-1 px-2">{monthToLabel(r.month, true)}</td>
+                        <td className="py-1 px-2 text-right">{formatINR(r.emi)}</td>
+                        <td className="py-1 px-2 text-right text-amber-700">{formatINR(r.interest)}</td>
+                        <td className="py-1 px-2 text-right text-emerald-700">{formatINR(r.principal)}</td>
+                        <td className="py-1 px-2 text-right text-indigo-700 font-medium">{r.prepayment > 0 ? formatINR(r.prepayment) : '—'}</td>
+                        <td className="py-1 px-2 text-right font-medium">{formatINR(r.balance)}</td>
+                      </tr>
+                    ))
+                    : yearlyData.map((y, i) => (
+                      <tr key={i} className="border-b border-slate-100 hover:bg-slate-50">
+                        <td className="py-1 px-2 font-medium">{y.year}</td>
+                        <td className="py-1 px-2">{monthToLabel(y.startMonth, true)} – {monthToLabel(y.endMonth, true)}</td>
+                        <td className="py-1 px-2 text-right">{formatINR(y.principal + y.interest)}</td>
+                        <td className="py-1 px-2 text-right text-amber-700">{formatINR(y.interest)}</td>
+                        <td className="py-1 px-2 text-right text-emerald-700">{formatINR(y.principal)}</td>
+                        <td className="py-1 px-2 text-right text-indigo-700 font-medium">{y.prepayment > 0 ? formatINR(y.prepayment) : '—'}</td>
+                        <td className="py-1 px-2 text-right font-medium">{formatINR(y.endBalance)}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <p className="text-center text-[10px] text-slate-400 py-2">
+          Today: {fmtFullDate(today)} · {autoState.autoCount} auto-applied EMI{autoState.autoCount !== 1 ? 's' : ''} · Rate {annualRate}% · Local-only, nothing sent anywhere
+        </p>
+      </div>
+
+      {/* CLOUD SYNC MODAL */}
+      {showSync && (
+        <SyncModal
+          config={gistConfig}
+          onSave={saveGistConfig}
+          onClose={() => setShowSync(false)}
+          onPush={() => pushToGist()}
+          onPull={() => pullFromGist()}
+          status={syncStatus}
+          message={syncMessage}
+          lastSync={lastSync}
+        />
+      )}
+    </div>
+  );
+};
+
+// ============ SUB-COMPONENTS ============
+const CompactInput = ({ label, value, onChange, step = 1, compact, width = 'w-24' }) => (
+  <div className="flex items-center gap-1.5">
+    <span className="text-[10px] font-medium text-slate-500 uppercase whitespace-nowrap">{label}</span>
+    <input
+      type="number"
+      value={value}
+      step={step}
+      onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+      className={`${width} px-1.5 py-1 text-xs border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-indigo-300`}
+    />
+    {compact && <span className="text-[10px] text-slate-400 whitespace-nowrap">{compact}</span>}
+  </div>
+);
+
+const SmallInput = ({ label, type = 'text', value, onChange, hint }) => (
+  <div>
+    <label className="text-[10px] text-slate-500 block leading-tight">{label}</label>
+    <input type={type} value={value} onChange={(e) => onChange(e.target.value)} className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm" />
+    {hint && <span className="text-[9px] text-slate-400">{hint}</span>}
+  </div>
+);
+
+const SmallSelect = ({ label, value, onChange, options }) => (
+  <div>
+    <label className="text-[10px] text-slate-500 block leading-tight">{label}</label>
+    <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white">
+      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  </div>
+);
+
+const ProgressBar = ({ label, left, right, pct, color, changed }) => (
+  <div>
+    <div className="flex items-center justify-between text-[11px] mb-0.5">
+      <span className="font-medium text-slate-700 flex items-center gap-1">
+        {label}
+        {changed && <span className="text-[9px] text-emerald-600 font-bold uppercase tracking-wider">live</span>}
+      </span>
+      <span className="text-slate-500">{left} <span className="text-slate-400">·</span> <b className="text-slate-700">{right}</b></span>
+    </div>
+    <div className="bg-slate-100 rounded-full h-1.5 overflow-hidden">
+      <div className={`${color} h-full rounded-full transition-all duration-300`} style={{ width: `${Math.min(pct, 100)}%` }} />
+    </div>
+  </div>
+);
+
+const MultiSegmentBar = ({ label, total, segments, changed }) => {
+  const totalFilled = segments.reduce((s, seg) => s + (seg.value || 0), 0);
+  const totalPct = total > 0 ? (totalFilled / total) * 100 : 0;
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[11px] mb-0.5">
+        <span className="font-medium text-slate-700 flex items-center gap-1">
+          {label}
+          {changed && <span className="text-[9px] text-emerald-600 font-bold uppercase tracking-wider">live</span>}
+        </span>
+        <span className="text-slate-500">
+          {formatINR(totalFilled, { compact: true })} of {formatINR(total, { compact: true })}
+          <span className="text-slate-400"> · </span>
+          <b className="text-slate-700">{totalPct.toFixed(1)}%</b>
+        </span>
+      </div>
+      <div className="bg-slate-100 rounded-full h-1.5 overflow-hidden flex">
+        {segments.map((seg, i) => (
+          <div
+            key={i}
+            className={`${seg.color} h-full transition-all duration-300`}
+            style={{ width: `${Math.min((seg.value / total) * 100, 100)}%` }}
+            title={`${seg.label}: ${formatINR(seg.value, { compact: true })}`}
+          />
+        ))}
+      </div>
+      <div className="flex items-center gap-3 mt-0.5 text-[9px]">
+        {segments.map((seg, i) => (
+          <span key={i} className="flex items-center gap-1">
+            <span className={`w-1.5 h-1.5 rounded-sm ${seg.color}`}></span>
+            <span className="text-slate-500">{seg.label}: <b className="text-slate-700">{formatINR(seg.value, { compact: true })}</b></span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const Stat = ({ label, value, sub, accent, highlight }) => {
+  const bgClass = accent === 'emerald'
+    ? 'bg-emerald-50 border-emerald-200'
+    : accent === 'indigo'
+    ? 'bg-white border-indigo-100'
+    : highlight
+    ? 'bg-emerald-50 border-emerald-100'
+    : 'bg-slate-50 border-slate-100';
+  const valClass = accent === 'emerald' ? 'text-emerald-700' : '';
+  return (
+    <div className={`p-2 rounded-md border ${bgClass}`}>
+      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">{label}</div>
+      <div className={`text-sm md:text-base font-bold mt-0.5 truncate ${valClass}`}>{value}</div>
+      <div className="text-[10px] text-slate-500 truncate">{sub}</div>
+    </div>
+  );
+};
+
+const Mini = ({ label, value, sub, good }) => (
+  <div>
+    <div className="text-[9px] uppercase tracking-wider text-slate-500 font-semibold">{label}</div>
+    <div className={`font-bold ${good ? 'text-emerald-700' : 'text-slate-800'}`}>{value}</div>
+    <div className="text-[9px] text-slate-400">{sub}</div>
+  </div>
+);
+
+const CompareRow = ({ label, base, opt, saved, saveGood }) => (
+  <tr className="border-t border-slate-200">
+    <td className="py-1.5 px-2 text-slate-700 font-medium">{label}</td>
+    <td className="py-1.5 px-2 text-right text-slate-600 font-mono">{base}</td>
+    <td className="py-1.5 px-2 text-right text-indigo-700 font-mono font-semibold bg-indigo-50/40">{opt}</td>
+    <td className={`py-1.5 px-2 text-right font-mono ${saveGood ? 'text-emerald-700 font-semibold bg-emerald-50/40' : 'text-slate-400 bg-slate-50/40'}`}>{saved}</td>
+  </tr>
+);
+
+const PrepayItem = ({ p, details, onToggle, onRemove, onEdit, monthToLabel }) => {
+  const desc = p.type === 'one_time'
+    ? `Once · ${monthToLabel(parseInt(p.month), true)}`
+    : `${p.frequency == 1 ? 'Monthly' : p.frequency == 3 ? 'Quarterly' : p.frequency == 6 ? 'Half-yearly' : 'Yearly'} · ${monthToLabel(parseInt(p.startMonth), true)}${p.endMonth && parseInt(p.endMonth) > 0 ? ` → ${monthToLabel(parseInt(p.endMonth), true)}` : ' onward'}`;
+  const canToggle = p.type === 'one_time';
+  const toneClass = details?.tone === 'paid' ? 'text-emerald-700' : details?.tone === 'recurring' ? 'text-indigo-700' : 'text-slate-700';
+
+  return (
+    <div className={`flex items-center gap-2 px-2 py-1.5 rounded-md border ${p.applied ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'}`}>
+      {canToggle ? (
+        <button onClick={onToggle} className={`shrink-0 flex items-center justify-center w-4 h-4 rounded border ${p.applied ? 'bg-emerald-500 border-emerald-500 text-white' : 'bg-white border-slate-300 hover:border-emerald-400'}`} title={p.applied ? 'Mark as not yet paid' : 'Mark as already paid'}>
+          {p.applied && <Check size={10} strokeWidth={3} />}
+        </button>
+      ) : (
+        <div className="shrink-0 w-4 h-4 flex items-center justify-center text-slate-300" title="Recurring is future-only">
+          <span className="text-[8px]">◯</span>
+        </div>
+      )}
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs font-bold text-slate-800">{formatINR(p.amount, { compact: true })}</span>
+          {p.applied && <span className="text-[9px] uppercase tracking-wide text-emerald-700 bg-emerald-200 px-1 py-0 rounded font-bold">Paid</span>}
+        </div>
+        <div className="text-[10px] text-slate-500 leading-tight truncate">{desc}</div>
+      </div>
+
+      <div className="text-right shrink-0">
+        <div className="text-[8px] uppercase tracking-wider text-slate-400 font-semibold">{details?.label}</div>
+        <div className={`text-[11px] font-bold ${toneClass}`}>{details?.value}</div>
+      </div>
+
+      <div className="flex items-center gap-0.5 shrink-0">
+        <button onClick={onEdit} className="text-slate-400 hover:text-indigo-600 p-1" title="Edit">
+          <Pencil size={11} />
+        </button>
+        <button onClick={onRemove} className="text-rose-400 hover:text-rose-600 p-1" title="Delete">
+          <Trash2 size={11} />
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const PrepayEditForm = ({ p, onUpdate, onDone, monthOptions }) => {
+  return (
+    <div className="bg-amber-50 border border-amber-300 rounded-md p-2 space-y-1.5 ring-1 ring-amber-200">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700 flex items-center gap-1">
+          <Pencil size={10} /> Editing {p.type === 'one_time' ? 'one-time' : 'recurring'}
+        </span>
+        <button onClick={onDone} className="text-[10px] bg-amber-600 hover:bg-amber-700 text-white font-bold px-2 py-0.5 rounded flex items-center gap-1">
+          <Check size={10} /> Done
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-1.5">
+        <div>
+          <label className="text-[9px] text-slate-500 block">Amount (₹)</label>
+          <input
+            type="number"
+            value={p.amount}
+            onChange={(e) => onUpdate({ amount: e.target.value })}
+            className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white"
+          />
+          <span className="text-[9px] text-slate-400">{formatINR(p.amount, { compact: true })}</span>
+        </div>
+        {p.type === 'one_time' ? (
+          <div>
+            <label className="text-[9px] text-slate-500 block">When</label>
+            <select
+              value={p.month}
+              onChange={(e) => onUpdate({ month: parseInt(e.target.value) })}
+              className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white"
+            >
+              {monthOptions.slice(0, 120).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        ) : (
+          <div>
+            <label className="text-[9px] text-slate-500 block">Frequency</label>
+            <select
+              value={p.frequency}
+              onChange={(e) => onUpdate({ frequency: parseInt(e.target.value) })}
+              className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white"
+            >
+              <option value="1">Monthly</option>
+              <option value="3">Quarterly</option>
+              <option value="6">Half-yearly</option>
+              <option value="12">Yearly</option>
+            </select>
+          </div>
+        )}
+      </div>
+
+      {p.type === 'recurring' && (
+        <div className="grid grid-cols-2 gap-1.5">
+          <div>
+            <label className="text-[9px] text-slate-500 block">From</label>
+            <select
+              value={p.startMonth}
+              onChange={(e) => onUpdate({ startMonth: parseInt(e.target.value) })}
+              className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white"
+            >
+              {monthOptions.slice(0, 120).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[9px] text-slate-500 block">Until</label>
+            <select
+              value={p.endMonth || 0}
+              onChange={(e) => onUpdate({ endMonth: parseInt(e.target.value) })}
+              className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-sm bg-white"
+            >
+              <option value={0}>End of loan</option>
+              {monthOptions.slice(0, 120).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+      )}
+
+      {p.type === 'one_time' && (
+        <label className="flex items-center gap-1.5 text-[11px] text-slate-700 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={p.applied || false}
+            onChange={(e) => onUpdate({ applied: e.target.checked })}
+            className="rounded"
+          />
+          Already paid
+        </label>
+      )}
+    </div>
+  );
+};
+
+// ============ TIMELINE COMPONENTS ============
+const YearRuler = ({ startDate, axisEndDate, today }) => {
+  const range = axisEndDate.getTime() - startDate.getTime();
+  const pct = (d) => Math.max(0, Math.min(100, ((d.getTime() - startDate.getTime()) / range) * 100));
+
+  const startYear = startDate.getFullYear();
+  const endYear = axisEndDate.getFullYear();
+  const ticks = [];
+  for (let y = startYear; y <= endYear; y++) {
+    if ((y - startYear) % 2 === 0 || y === endYear) {
+      const tickDate = new Date(y, 0, 1);
+      if (tickDate >= startDate && tickDate <= axisEndDate) {
+        ticks.push({ x: pct(tickDate), label: `'${y.toString().slice(-2)}` });
+      }
+    }
+  }
+
+  const todayPct = pct(today);
+
+  return (
+    <div className="relative h-4 mb-1">
+      <div className="absolute inset-x-0 top-1/2 h-px bg-slate-200" />
+      {ticks.map((t, i) => (
+        <div key={i} className="absolute -translate-x-1/2 text-[9px] text-slate-500" style={{ left: `${t.x}%`, top: 0 }}>
+          {t.label}
+        </div>
+      ))}
+      {/* Today marker on ruler */}
+      <div className="absolute -translate-x-1/2 z-10" style={{ left: `${todayPct}%`, top: 0 }}>
+        <div className="text-[9px] font-bold text-rose-600 whitespace-nowrap">Today</div>
+      </div>
+    </div>
+  );
+};
+
+const Timeline = ({ label, start, end, today, axisStart, axisEnd, barColor, originalEnd, events = [], endLabel, yearEnds = [] }) => {
+  const range = axisEnd.getTime() - axisStart.getTime();
+  const pct = (d) => Math.max(0, Math.min(100, ((d.getTime() - axisStart.getTime()) / range) * 100));
+
+  const startPct = pct(start);
+  const endPct = pct(end);
+  const todayPct = pct(today);
+  const origEndPct = originalEnd ? pct(originalEnd) : null;
+
+  const isFinished = today.getTime() >= end.getTime();
+  const paidWidth = Math.max(0, Math.min(todayPct, endPct) - startPct);
+  const futureWidth = isFinished ? 0 : Math.max(0, endPct - todayPct);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[11px] mb-1">
+        <span className="font-medium text-slate-700">{label}</span>
+        <span className="text-slate-500">ends <b className="text-slate-700">{endLabel}</b></span>
+      </div>
+
+      <div className="relative h-7 bg-slate-100 rounded-md">
+        {/* paid portion */}
+        <div
+          className="absolute top-0 bottom-0 bg-emerald-400 rounded-l-md"
+          style={{ left: `${startPct}%`, width: `${paidWidth}%` }}
+          title="Paid"
+        />
+        {/* future portion until end */}
+        {!isFinished && (
+          <div
+            className="absolute top-0 bottom-0"
+            style={{
+              left: `${todayPct}%`,
+              width: `${futureWidth}%`,
+              backgroundColor: barColor,
+              opacity: 0.65
+            }}
+            title="Remaining"
+          />
+        )}
+        {/* saved zone (if optimized ends earlier than original) */}
+        {origEndPct && origEndPct > endPct && (
+          <div
+            className="absolute top-0 bottom-0 rounded-r-md"
+            style={{
+              left: `${endPct}%`,
+              width: `${origEndPct - endPct}%`,
+              background: 'repeating-linear-gradient(45deg, rgba(16,185,129,0.08), rgba(16,185,129,0.08) 4px, rgba(16,185,129,0.18) 4px, rgba(16,185,129,0.18) 8px)',
+              borderLeft: '2px dashed rgba(16,185,129,0.6)'
+            }}
+            title={`Saved time (${endLabel} → ${fmtMY(originalEnd)})`}
+          />
+        )}
+        {/* year-end vertical guides on the bar */}
+        {yearEnds.map((m, i) => {
+          const yPct = pct(m.date);
+          if (yPct <= startPct + 0.5 || yPct >= 100) return null;
+          return (
+            <div
+              key={`yg-${i}`}
+              className="absolute top-0 bottom-0 w-px bg-slate-500/25 pointer-events-none z-0"
+              style={{ left: `${yPct}%` }}
+            />
+          );
+        })}
+        {/* today vertical line */}
+        <div
+          className="absolute -top-1 -bottom-1 w-0.5 bg-rose-600 z-10"
+          style={{ left: `${todayPct}%` }}
+        />
+        {/* end marker */}
+        <div
+          className="absolute -top-0.5 -bottom-0.5 w-px bg-slate-700 z-10"
+          style={{ left: `${endPct}%` }}
+        />
+        {/* event markers */}
+        {events.map((e, i) => {
+          const ePct = pct(e.date);
+          if (ePct < startPct || ePct > 100) return null;
+          return (
+            <div
+              key={i}
+              className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 z-20 group"
+              style={{ left: `${ePct}%` }}
+            >
+              <div className="w-[7.5px] h-[7.5px] rounded-full bg-amber-500 border border-white shadow-sm hover:scale-150 transition-transform cursor-help" />
+              <div className="absolute bottom-full mb-1 left-1/2 -translate-x-1/2 hidden group-hover:block bg-slate-900 text-white text-[9px] px-1.5 py-0.5 rounded whitespace-nowrap z-30">
+                {e.label}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Year-end balance labels below the bar */}
+      {yearEnds.length > 0 && (
+        <div className="relative h-8 mt-0.5">
+          {yearEnds.map((m, i) => {
+            const yPct = pct(m.date);
+            if (yPct < 0 || yPct > 100) return null;
+            const isLast = i === yearEnds.length - 1 && m.balance < 1000;
+            return (
+              <div
+                key={`yl-${i}`}
+                className="absolute -translate-x-1/2 text-center whitespace-nowrap leading-none"
+                style={{ left: `${yPct}%` }}
+                title={`End of ${m.year}: ${formatINR(m.balance)}`}
+              >
+                <div className="w-px h-1 bg-slate-300 mx-auto" />
+                <div className={`text-[11px] font-semibold leading-tight ${isLast ? 'text-emerald-700' : 'text-slate-700'}`}>
+                  {isLast ? '✓' : fmtL(m.balance)}
+                </div>
+                <div className="text-[10px] text-slate-400 leading-tight">'{m.year.toString().slice(-2)}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="relative h-3 mt-0.5 text-[9px]">
+        <span className="absolute left-0 text-slate-400">{fmtShortMY(start)}</span>
+        {origEndPct !== null && origEndPct > endPct && (
+          <span
+            className="absolute -translate-x-1/2 text-emerald-700 font-semibold whitespace-nowrap"
+            style={{ left: `${endPct}%` }}
+          >
+            ↑ closes {endLabel}
+          </span>
+        )}
+        <span className="absolute right-0 text-slate-400">{fmtShortMY(axisEnd)}</span>
+      </div>
+    </div>
+  );
+};
+
+const SyncModal = ({ config, onSave, onClose, onPush, onPull, status, message, lastSync }) => {
+  const [draft, setDraft] = useState(config);
+  const isConfigured = config.gistId && config.token;
+
+  const update = (patch) => setDraft({ ...draft, ...patch });
+
+  const handleTestAndSave = async () => {
+    onSave(draft);
+    // small delay to let state propagate, then push
+    setTimeout(() => onPush(), 50);
+  };
+
+  const handleDisconnect = () => {
+    if (confirm('Disconnect cloud sync? Local data stays.')) {
+      onSave({ gistId: '', token: '', autoSave: false });
+      setDraft({ gistId: '', token: '', autoSave: false });
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+          <h2 className="text-sm font-bold flex items-center gap-2">
+            <Cloud size={14} /> Cloud Sync (GitHub Gist)
+          </h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700"><X size={16} /></button>
+        </div>
+
+        <div className="p-4 space-y-3">
+          {/* Status */}
+          <div className={`rounded-md p-2 text-xs ${
+            status === 'synced' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+            : status === 'syncing' ? 'bg-amber-50 text-amber-800 border border-amber-200'
+            : status === 'error' ? 'bg-rose-50 text-rose-800 border border-rose-200'
+            : 'bg-slate-50 text-slate-600 border border-slate-200'
+          }`}>
+            <b className="capitalize">{isConfigured ? status : 'Not configured'}</b>
+            {message && <span> · {message}</span>}
+            {lastSync && status !== 'error' && <span className="text-slate-500"> · last {lastSync.toLocaleTimeString()}</span>}
+          </div>
+
+          {/* Setup help */}
+          <details className="bg-blue-50 border border-blue-200 rounded-md text-xs">
+            <summary className="cursor-pointer p-2 font-semibold text-blue-800">📘 First-time setup (3 minutes)</summary>
+            <div className="p-2 pt-0 space-y-2 text-blue-900">
+              <div>
+                <b>Step 1 · Create a private Gist</b>
+                <ol className="list-decimal list-inside ml-2 mt-1 space-y-0.5">
+                  <li>Go to <a href="https://gist.github.com" target="_blank" rel="noopener" className="underline">gist.github.com</a> (sign in)</li>
+                  <li>Filename: <code className="bg-white px-1 rounded">loan_dashboard.json</code> · Content: <code className="bg-white px-1 rounded">{'{}'}</code></li>
+                  <li>Click <b>Create secret gist</b></li>
+                  <li>Copy the Gist ID from the URL after your username</li>
+                </ol>
+              </div>
+              <div>
+                <b>Step 2 · Create a Personal Access Token</b>
+                <ol className="list-decimal list-inside ml-2 mt-1 space-y-0.5">
+                  <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=Loan+Dashboard+Sync" target="_blank" rel="noopener" className="underline">Open this link</a> (pre-fills scope)</li>
+                  <li>Set expiration (90 days or longer)</li>
+                  <li>Click Generate · copy the token immediately (shown once)</li>
+                </ol>
+              </div>
+              <div>
+                <b>Step 3 · Paste both below</b> and click <b>Test & Save</b>
+              </div>
+            </div>
+          </details>
+
+          {/* Inputs */}
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-600 block mb-1">Gist ID</label>
+            <input
+              type="text"
+              value={draft.gistId}
+              onChange={(e) => update({ gistId: e.target.value.trim() })}
+              placeholder="abc123def456..."
+              className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded font-mono"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-600 block mb-1">GitHub Token</label>
+            <input
+              type="password"
+              value={draft.token}
+              onChange={(e) => update({ token: e.target.value.trim() })}
+              placeholder="ghp_..."
+              className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded font-mono"
+            />
+            <p className="text-[10px] text-slate-500 mt-0.5">Stored in your browser only. Never sent anywhere except api.github.com.</p>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={draft.autoSave}
+              onChange={(e) => update({ autoSave: e.target.checked })}
+              className="rounded"
+            />
+            Auto-save to cloud after every edit (2s debounce)
+          </label>
+
+          {/* Buttons */}
+          <div className="flex gap-2 flex-wrap pt-1">
+            <button
+              onClick={handleTestAndSave}
+              disabled={!draft.gistId || !draft.token}
+              className="flex-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white text-xs font-medium rounded"
+            >
+              Test & Save
+            </button>
+            <button
+              onClick={onPull}
+              disabled={!isConfigured}
+              className="px-3 py-1.5 bg-white hover:bg-slate-50 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed border border-slate-300 text-xs font-medium rounded"
+            >
+              Force Pull
+            </button>
+            <button
+              onClick={onPush}
+              disabled={!isConfigured}
+              className="px-3 py-1.5 bg-white hover:bg-slate-50 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed border border-slate-300 text-xs font-medium rounded"
+            >
+              Force Push
+            </button>
+            {isConfigured && (
+              <button
+                onClick={handleDisconnect}
+                className="px-3 py-1.5 bg-white hover:bg-rose-50 border border-rose-200 text-rose-700 text-xs font-medium rounded"
+              >
+                Disconnect
+              </button>
+            )}
+          </div>
+
+          <p className="text-[10px] text-slate-400 pt-1">
+            Syncs: outstanding, rate, EMI, remaining months, prepayment mode, and your prepayment list. Loan snapshot stays hardcoded.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<Dashboard />);
+</script>
+</body>
+</html>
