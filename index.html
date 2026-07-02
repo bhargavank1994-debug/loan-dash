@@ -76,6 +76,10 @@ const fmtL = (num) => {
 // ============ STATIC LOAN DATA ============
 // Snapshot refreshed Jun 2026: outstanding brought down to ₹49L after a prepayment.
 // This figure is the balance BEFORE the Jul 10 2026 EMI (snapshotNextDue = Jul 10).
+// Bump SNAPSHOT_VERSION whenever ORIG is refreshed from the bank: cloud-synced params
+// saved under an older version are ignored for loan figures, so a stale Gist can never
+// overwrite a corrected balance (prepayment plans still restore).
+const SNAPSHOT_VERSION = 2;
 const ORIG = {
   loanAmount: 11366000,
   paidPrincipal: 6466000,        // = original loan − ₹49L outstanding
@@ -539,6 +543,7 @@ const Dashboard = () => {
 
   const collectData = () => ({
     version: 1,
+    snapshotVersion: SNAPSHOT_VERSION,
     savedAt: new Date().toISOString(),
     outstanding,
     annualRate,
@@ -550,10 +555,15 @@ const Dashboard = () => {
 
   const applyData = (data) => {
     if (!data || typeof data !== 'object') return;
-    if (typeof data.outstanding === 'number') setOutstanding(data.outstanding);
-    if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
-    if (typeof data.emi === 'number') setEmi(data.emi);
-    if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
+    // Loan figures only restore when saved AFTER the latest bank-snapshot refresh —
+    // otherwise a stale cloud copy would overwrite the corrected balance (the ₹50.3L
+    // vs ₹49L bug). Prepayment plans always restore: no data loss.
+    if (data.snapshotVersion === SNAPSHOT_VERSION) {
+      if (typeof data.outstanding === 'number') setOutstanding(data.outstanding);
+      if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
+      if (typeof data.emi === 'number') setEmi(data.emi);
+      if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
+    }
     if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
     if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
   };
