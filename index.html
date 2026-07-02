@@ -8,6 +8,8 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
 <style>
+  /* 16px → 15px base compacts every rem-based Tailwind size ~6% across the page */
+  html { font-size: 15px; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; margin: 0; }
   .loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #64748b; font-size: 0.875rem; }
 </style>
@@ -72,20 +74,22 @@ const fmtL = (num) => {
 };
 
 // ============ STATIC LOAN DATA ============
+// Snapshot refreshed Jun 2026: outstanding brought down to ₹49L after a prepayment.
+// This figure is the balance BEFORE the Jul 10 2026 EMI (snapshotNextDue = Jul 10).
 const ORIG = {
   loanAmount: 11366000,
-  paidPrincipal: 4844453,
-  paidInterest: 2894885,
-  paidTotal: 7739338,
-  outstandingPrincipal: 6522741,
-  totalTenure: 124,
-  monthsPaid: 41,
-  remainingTenure: 83,
+  paidPrincipal: 6466000,        // = original loan − ₹49L outstanding
+  paidInterest: 2980885,         // cumulative interest paid to date (≈)
+  paidTotal: 9446885,
+  outstandingPrincipal: 4900000, // ₹49L — current balance, before the Jul EMI
+  totalTenure: 101,              // 43 paid + ~58 remaining after prepayment
+  monthsPaid: 43,
+  remainingTenure: 58,
   currentEMI: 102408,
   agreementDate: new Date(2022, 1, 17),
   firstEMIDate: new Date(2022, 11, 10),
-  maturityDate: new Date(2033, 2, 10),
-  snapshotNextDue: new Date(2026, 4, 10),
+  maturityDate: new Date(2031, 3, 10), // ~Apr 2031 after prepayment
+  snapshotNextDue: new Date(2026, 6, 10), // Jul 10 2026 (next EMI) — keeps balance at ₹49L until then
   inferredRate: 7.95
 };
 
@@ -220,7 +224,7 @@ const Dashboard = () => {
   const [prepayMode, setPrepayMode] = useState('reduce_tenure');
   const [prepayments, setPrepayments] = useState([]);
   const [editingId, setEditingId] = useState(null);
-  const [showTable, setShowTable] = useState(false);
+  const [showTable, setShowTable] = useState(true);
   const [tableView, setTableView] = useState('monthly'); // monthly default
 
   // ===== Cloud sync via GitHub Gist =====
@@ -305,6 +309,27 @@ const Dashboard = () => {
   const interestSaved = baseline.totalInterest - optimized.totalInterest;
   const monthsSaved = baseline.finalMonth - optimized.finalMonth;
   const yearsSaved = (monthsSaved / 12).toFixed(1);
+
+  // Guidance: what ONE lakh prepaid right now buys you (interest saved + months cut)
+  const lakhImpact = useMemo(() => {
+    if (adjusted.outstanding <= 100000) return { interestSaved: 0, monthsSaved: 0 };
+    const withLakh = computeSchedule({
+      startBalance: adjusted.outstanding,
+      annualRate,
+      initialEMI: emi,
+      prepayments: [{ month: 1, amount: 100000 }],
+      prepayMode: 'reduce_tenure',
+      originalRemainingMonths: remainingMonths
+    });
+    return {
+      interestSaved: baseline.totalInterest - withLakh.totalInterest,
+      monthsSaved: baseline.finalMonth - withLakh.finalMonth
+    };
+  }, [adjusted.outstanding, annualRate, emi, remainingMonths, baseline]);
+
+  // Guidance: share of the next EMI that builds equity (principal share)
+  const nextRow = optimized.schedule[0];
+  const principalShare = nextRow && nextRow.emi > 0 ? Math.round((nextRow.principal / nextRow.emi) * 100) : 0;
 
   // Progress metrics — Current (actual, vs original loan plan)
   const interestTotalCurrent = autoState.paidInterest + baseline.totalInterest;
@@ -426,6 +451,28 @@ const Dashboard = () => {
     }
     return data;
   }, [baseline, optimized]);
+
+  // Per-month principal vs interest split (for the stacked chart)
+  const splitData = useMemo(() => {
+    const len = optimized.schedule.length;
+    if (!len) return [];
+    const step = Math.max(1, Math.floor(len / 60));
+    const data = [];
+    for (let i = 0; i < len; i += step) {
+      const r = optimized.schedule[i];
+      if (!r) continue;
+      data.push({
+        label: monthToLabel(r.month),
+        interest: Math.round(r.interest),
+        principal: Math.round(r.principal)
+      });
+    }
+    const last = optimized.schedule[len - 1];
+    if (last && data[data.length - 1]?.label !== monthToLabel(last.month)) {
+      data.push({ label: monthToLabel(last.month), interest: Math.round(last.interest), principal: Math.round(last.principal) });
+    }
+    return data;
+  }, [optimized]);
 
   // Yearly amortization rollup
   const yearlyData = useMemo(() => {
@@ -676,6 +723,30 @@ const Dashboard = () => {
       </div>
 
       <div className="max-w-7xl mx-auto px-3 md:px-6 py-3 space-y-3">
+
+        {/* GUIDANCE STRIP — the four numbers that matter, at a glance */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="bg-white rounded-lg border border-slate-200 p-2">
+            <div className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">Where you stand</div>
+            <div className="text-sm font-bold text-slate-800">{formatINR(adjusted.outstanding, { compact: true })} to go</div>
+            <div className="text-[10px] text-slate-500">{((adjusted.paidPrincipal / ORIG.loanAmount) * 100).toFixed(0)}% of principal repaid</div>
+          </div>
+          <div className="bg-white rounded-lg border border-slate-200 p-2">
+            <div className="text-[9px] uppercase tracking-wider text-indigo-600 font-bold">Freedom date</div>
+            <div className="text-sm font-bold text-indigo-700">{fmtMY(optimizedEndDate)}</div>
+            <div className="text-[10px] text-slate-500">{optimized.finalMonth} EMIs to go{monthsSaved > 0 ? ` · ${monthsSaved} mo earlier than plan` : ''}</div>
+          </div>
+          <div className="bg-white rounded-lg border border-slate-200 p-2">
+            <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">Next EMI · {fmtMY(firstFutureDate)}</div>
+            <div className="text-sm font-bold text-emerald-700">{principalShare}% builds equity</div>
+            <div className="text-[10px] text-slate-500">{formatINR(nextRow?.principal || 0, { compact: true })} principal · {formatINR(nextRow?.interest || 0, { compact: true })} interest</div>
+          </div>
+          <div className="bg-emerald-50 rounded-lg border border-emerald-200 p-2">
+            <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">💡 Every ₹1L prepaid now</div>
+            <div className="text-sm font-bold text-emerald-800">saves {formatINR(lakhImpact.interestSaved, { compact: true })} interest</div>
+            <div className="text-[10px] text-emerald-600">closes {lakhImpact.monthsSaved} month{lakhImpact.monthsSaved === 1 ? '' : 's'} earlier</div>
+          </div>
+        </div>
 
         {/* LOAN JOURNEY TIMELINE - moved to top */}
         <div className="bg-white rounded-lg border border-slate-200 p-3">
@@ -988,7 +1059,7 @@ const Dashboard = () => {
                     <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => formatINR(v, { compact: true, showSymbol: false })} />
                     <Tooltip formatter={(v) => formatINR(v)} labelFormatter={(l) => l} contentStyle={{ fontSize: 11 }} />
                     <Legend wrapperStyle={{ fontSize: 10 }} />
-                    <Area type="monotone" dataKey="baseline" stroke="#94a3b8" fill="#cbd5e1" fillOpacity={0.4} name="Baseline" />
+                    <Area type="monotone" dataKey="baseline" stroke="#94a3b8" fill="#cbd5e1" fillOpacity={0.4} name="No prepay" />
                     <Area type="monotone" dataKey="optimized" stroke="#4f46e5" fill="#6366f1" fillOpacity={0.5} name="With prepay" />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -1001,7 +1072,7 @@ const Dashboard = () => {
         <div className="bg-white rounded-lg border border-slate-200 p-3">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold flex items-center gap-1.5">
-              <Calendar size={14} className="text-slate-400" /> Amortization Schedule
+              <Calendar size={14} className="text-slate-400" /> Monthly Principal vs Interest
             </h2>
             <div className="flex gap-2">
               <select value={tableView} onChange={(e) => setTableView(e.target.value)} className="text-[11px] border border-slate-200 rounded-sm px-1.5 py-0.5 bg-white">
@@ -1010,9 +1081,38 @@ const Dashboard = () => {
               </select>
               <button onClick={() => setShowTable(!showTable)} className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1">
                 {showTable ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                {showTable ? 'Hide' : 'Show'}
+                {showTable ? 'Hide table' : 'Show table'}
               </button>
             </div>
+          </div>
+
+          <div className="mt-2 border-t border-slate-100 pt-2">
+            <div className="flex gap-2 mb-2">
+              <div className="flex-1 bg-emerald-50 border border-emerald-200 rounded-md p-2">
+                <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">Next EMI · principal</div>
+                <div className="text-base font-bold text-emerald-800">{formatINR(optimized.schedule[0]?.principal || 0)}</div>
+                <div className="text-[10px] text-emerald-600">{monthToLabel(1, true)}</div>
+              </div>
+              <div className="flex-1 bg-amber-50 border border-amber-200 rounded-md p-2">
+                <div className="text-[9px] uppercase tracking-wider text-amber-700 font-bold">Next EMI · interest</div>
+                <div className="text-base font-bold text-amber-800">{formatINR(optimized.schedule[0]?.interest || 0)}</div>
+                <div className="text-[10px] text-amber-600">of {formatINR(optimized.schedule[0]?.emi || 0)} EMI</div>
+              </div>
+            </div>
+            <div className="h-44">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={splitData} margin={{ top: 5, right: 8, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="label" tick={{ fontSize: 9 }} interval="preserveStartEnd" />
+                  <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => formatINR(v, { compact: true, showSymbol: false })} />
+                  <Tooltip formatter={(v, n) => [formatINR(v), n]} contentStyle={{ fontSize: 11 }} />
+                  <Legend wrapperStyle={{ fontSize: 10 }} />
+                  <Area type="monotone" dataKey="interest" stackId="1" stroke="#d97706" fill="#fbbf24" fillOpacity={0.65} name="Interest" />
+                  <Area type="monotone" dataKey="principal" stackId="1" stroke="#059669" fill="#34d399" fillOpacity={0.65} name="Principal" />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="text-[10px] text-slate-500 mt-1">Each EMI is {formatINR(optimized.schedule[0]?.emi || 0)}. Interest (amber) shrinks and principal (green) grows every month as the balance falls.</div>
           </div>
 
           {showTable && (
