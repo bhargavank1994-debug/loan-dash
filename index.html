@@ -79,7 +79,7 @@ const fmtL = (num) => {
 // Bump SNAPSHOT_VERSION whenever ORIG is refreshed from the bank: cloud-synced params
 // saved under an older version are ignored for loan figures, so a stale Gist can never
 // overwrite a corrected balance (prepayment plans still restore).
-const SNAPSHOT_VERSION = 2;
+const SNAPSHOT_VERSION = 3;
 const ORIG = {
   loanAmount: 11366000,
   paidPrincipal: 6466000,        // = original loan − ₹49L outstanding
@@ -555,17 +555,24 @@ const Dashboard = () => {
 
   const applyData = (data) => {
     if (!data || typeof data !== 'object') return;
-    // Loan figures only restore when saved AFTER the latest bank-snapshot refresh —
-    // otherwise a stale cloud copy would overwrite the corrected balance (the ₹50.3L
-    // vs ₹49L bug). Prepayment plans always restore: no data loss.
+    if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
     if (data.snapshotVersion === SNAPSHOT_VERSION) {
+      // Cloud copy is from the current snapshot era — restore everything.
       if (typeof data.outstanding === 'number') setOutstanding(data.outstanding);
       if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
       if (typeof data.emi === 'number') setEmi(data.emi);
       if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
+      if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
+      return;
     }
-    if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
-    if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
+    // Cloud copy predates the latest bank-snapshot refresh ("work backwards" rule):
+    // the refreshed ORIG outstanding is the source of truth for the CURRENT balance,
+    // so stale loan figures are ignored, and prepayments already marked "applied"
+    // are dropped — their effect is baked into the new outstanding. Future planned
+    // prepayments are pure simulation inputs, so they are kept. No plans are lost.
+    if (Array.isArray(data.prepayments)) {
+      setPrepayments(data.prepayments.filter((p) => !p.applied));
+    }
   };
 
   const pushToGist = async (cfg) => {
@@ -639,6 +646,11 @@ const Dashboard = () => {
         return false;
       }
       applyData(data);
+      if (data.snapshotVersion !== SNAPSHOT_VERSION) {
+        // One-time self-heal: the cloud copy predates the snapshot refresh, so push
+        // freshly-stamped data back up — every device converges on the new balance.
+        setTimeout(() => pushToGist(c), 1500);
+      }
       setSyncStatus('synced');
       setLastSync(new Date());
       setSyncMessage(`Loaded · saved ${data.savedAt ? new Date(data.savedAt).toLocaleString() : 'unknown'}`);
