@@ -84,8 +84,8 @@ const SNAPSHOT_VERSION = 4;
 const ORIG = {
   loanAmount: 11366000,
   paidPrincipal: 7266000,        // = original loan − ₹41L outstanding
-  paidInterest: 3013348,         // cumulative interest paid to date (≈, prev 2980885 + Jul EMI ≈32463)
-  paidTotal: 10279348,
+  paidInterest: 3012735,         // cumulative interest paid to date (≈, prev 2980885 + Jul EMI ≈31850 @7.8%)
+  paidTotal: 10278735,
   outstandingPrincipal: 4100000, // ₹41L — bank balance 3 Aug 2026, before the Aug EMI
   totalTenure: 91,               // 44 paid + ~47 remaining at current EMI
   monthsPaid: 44,
@@ -95,7 +95,7 @@ const ORIG = {
   firstEMIDate: new Date(2022, 11, 10),
   maturityDate: new Date(2030, 5, 10), // ~Jun 2030: 47th EMI counted from Aug 10 2026
   snapshotNextDue: new Date(2026, 7, 10), // Aug 10 2026 (next EMI) — keeps balance at ₹41L until then
-  inferredRate: 7.95
+  inferredRate: 7.8 // confirmed from the bank Aug 2026 (was 7.95 inferred). No SNAPSHOT_VERSION bump: the balance anchor is unchanged, and same-era saves carry the user's rate anyway.
 };
 
 // ============ AMORTIZATION ENGINE ============
