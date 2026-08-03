@@ -18,7 +18,7 @@
 <div id="root"><div class="loading">Loading dashboard…</div></div>
 
 <script type="text/babel" data-type="module" data-presets="react">
-import React, { useState, useMemo, useEffect } from 'https://esm.sh/react@18.3.1';
+import React, { useState, useMemo, useEffect, useRef } from 'https://esm.sh/react@18.3.1';
 import ReactDOM from 'https://esm.sh/react-dom@18.3.1/client';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
@@ -75,8 +75,8 @@ const fmtL = (num) => {
 
 // ============ STATIC LOAN DATA ============
 // Snapshot refreshed 3 Aug 2026 from the bank: outstanding ₹41L exactly, stated as of today.
-// This figure is the balance BEFORE the Aug 10 2026 EMI (snapshotNextDue = Aug 10). The ~₹7.3L
-// drop since the Jun snapshot = the Jul 10 EMI principal plus the prepayment made since.
+// This figure is the balance BEFORE the Aug 10 2026 EMI (snapshotNextDue = Aug 10). The ₹8.0L
+// drop since the Jun snapshot = the Jul 10 EMI principal (~₹0.7L) + ~₹7.3L of prepayment.
 // Bump SNAPSHOT_VERSION whenever ORIG is refreshed from the bank: cloud-synced params
 // saved under an older version are ignored for loan figures, so a stale Gist can never
 // overwrite a corrected balance (prepayment plans still restore).
@@ -167,51 +167,79 @@ function computeSchedule({
 }
 
 // ============ AUTO-DEDUCTION ON 10TH ============
-function getAutoState() {
-  const today = new Date();
-  const monthlyRate = ORIG.inferredRate / 12 / 100;
+// The tracked figure runs on two rails: `outstanding` excludes applied prepayments (they are
+// subtracted at display time as appliedSum), but the BANK charges interest on the true balance.
+// So every rolled EMI must charge interest on (outstanding − prepayments applied by that date),
+// or the balance drifts above the bank by appliedSum × monthlyRate every month.
+function appliedBeforeDate(preps, timeMs) {
+  return (preps || [])
+    .filter((p) => p.applied && p.type === 'one_time')
+    .reduce((sum, p) => {
+      // No appliedAt (legacy rows) = treated as baked in since the snapshot.
+      const at = p.appliedAt ? new Date(p.appliedAt).getTime() : 0;
+      return at <= timeMs ? sum + (parseFloat(p.amount) || 0) : sum;
+    }, 0);
+}
 
-  // Count EMI dates (snapshotNextDue is the first; next on the 10th of each subsequent month)
-  let count = 0;
+// Deduct every EMI due after `fromMs` up to now. Returns the rolled figure plus what those
+// EMIs paid. Rate/EMI default to the snapshot's but honor user-corrected values when passed.
+function rollEmis(startValue, fromMs, preps, rate, emiAmount) {
+  const now = new Date();
+  const monthlyRate = (rate || ORIG.inferredRate) / 12 / 100;
+  const emiValue = emiAmount || ORIG.currentEMI;
+  let outstanding = startValue;
+  let paidPrincipal = 0;
+  let paidInterest = 0;
+  let count = 0;       // every EMI date since the snapshot (for tenure/progress counters)
+  let deducted = 0;    // only the ones actually applied to the balance here
   let cursor = new Date(ORIG.snapshotNextDue);
-  while (cursor.getTime() <= today.getTime()) {
+  while (cursor.getTime() <= now.getTime()) {
     count++;
+    if (cursor.getTime() > fromMs) {
+      const trueBalance = Math.max(0, outstanding - appliedBeforeDate(preps, cursor.getTime()));
+      if (trueBalance > 0.5) {
+        const interest = trueBalance * monthlyRate;
+        let principal = Math.min(emiValue - interest, trueBalance);
+        if (principal < 0) principal = 0;
+        outstanding -= principal;
+        paidPrincipal += principal;
+        paidInterest += interest;
+        deducted++;
+      }
+    }
     cursor = addMonths(cursor, 1);
   }
-  // cursor is now the *next future* EMI date
+  return { outstanding, paidPrincipal, paidInterest, count, deducted, firstFutureDate: cursor, today: now };
+}
 
-  let outstanding = ORIG.outstandingPrincipal;
-  let paidPrincipal = ORIG.paidPrincipal;
-  let paidInterest = ORIG.paidInterest;
-
-  for (let i = 0; i < count; i++) {
-    if (outstanding <= 0.5) break;
-    const interest = outstanding * monthlyRate;
-    let principal = Math.min(ORIG.currentEMI - interest, outstanding);
-    if (principal < 0) principal = 0;
-    outstanding -= principal;
-    paidPrincipal += principal;
-    paidInterest += interest;
-  }
-
+function getAutoState(preps, rate, emiAmount) {
+  const rolled = rollEmis(ORIG.outstandingPrincipal, -1, preps, rate, emiAmount);
   return {
-    autoCount: count,
-    today,
-    firstFutureDate: cursor,
-    outstanding,
-    paidPrincipal,
-    paidInterest,
-    paidTotal: paidPrincipal + paidInterest,
-    monthsPaid: ORIG.monthsPaid + count,
-    remainingTenure: Math.max(0, ORIG.remainingTenure - count)
+    autoCount: rolled.count,
+    today: rolled.today,
+    firstFutureDate: rolled.firstFutureDate,
+    outstanding: rolled.outstanding,
+    paidPrincipal: ORIG.paidPrincipal + rolled.paidPrincipal,
+    paidInterest: ORIG.paidInterest + rolled.paidInterest,
+    paidTotal: ORIG.paidPrincipal + rolled.paidPrincipal + ORIG.paidInterest + rolled.paidInterest,
+    monthsPaid: ORIG.monthsPaid + rolled.count,
+    remainingTenure: Math.max(0, ORIG.remainingTenure - rolled.count)
   };
 }
 
 // ============ MAIN COMPONENT ============
 const Dashboard = () => {
-  const autoState = useMemo(() => getAutoState(), []);
-  const today = autoState.today;
-  const firstFutureDate = autoState.firstFutureDate;
+  // Mount-time roll with defaults, used only to seed the editable state below. The live
+  // autoState (further down) recomputes whenever prepayments / rate / EMI change, so applied
+  // prepayments feed the interest base of every auto-deducted EMI.
+  const initialAuto = useMemo(() => getAutoState([], ORIG.inferredRate, ORIG.currentEMI), []);
+  const today = initialAuto.today;
+  const firstFutureDate = initialAuto.firstFutureDate;
+  // The moment the `outstanding` figure was last known to be true. Stamped on mount, on a
+  // manual edit, and on restore — and SAVED with the data, so a sync can never claim the
+  // save-time freshness for a balance that was actually rolled earlier (the bug that let a
+  // tab left open across the 10th permanently skip an EMI).
+  const balanceAsOfRef = useRef(initialAuto.today.getTime());
 
   const monthToLabel = (m, full = false) => {
     const d = addMonths(firstFutureDate, m - 1);
@@ -221,13 +249,20 @@ const Dashboard = () => {
   };
   const monthToDate = (m) => addMonths(firstFutureDate, m - 1);
 
-  // Editable state (defaults from autoState)
-  const [outstanding, setOutstanding] = useState(autoState.outstanding);
+  // Editable state (defaults from the mount-time roll)
+  const [outstanding, setOutstandingRaw] = useState(initialAuto.outstanding);
   const [annualRate, setAnnualRate] = useState(ORIG.inferredRate);
   const [emi, setEmi] = useState(ORIG.currentEMI);
-  const [remainingMonths, setRemainingMonths] = useState(autoState.remainingTenure);
+  const [remainingMonths, setRemainingMonths] = useState(initialAuto.remainingTenure);
   const [prepayMode, setPrepayMode] = useState('reduce_tenure');
   const [prepayments, setPrepayments] = useState([]);
+  // A manually typed balance is true as of the moment it was typed.
+  const setOutstanding = (value) => {
+    balanceAsOfRef.current = Date.now();
+    setOutstandingRaw(value);
+  };
+  // Live auto-deduction state: recomputes when applied prepayments or corrected rate/EMI change.
+  const autoState = useMemo(() => getAutoState(prepayments, annualRate, emi), [prepayments, annualRate, emi]);
   const [editingId, setEditingId] = useState(null);
   const [showTable, setShowTable] = useState(true);
   const [tableView, setTableView] = useState('monthly'); // monthly default
@@ -513,25 +548,33 @@ const Dashboard = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [futurePrepayments, firstFutureDate]);
 
-  // Actions
+  // Actions. Marking a prepayment "applied" stamps WHEN, because the interest base of every
+  // later auto-deducted EMI depends on it; un-marking clears the stamp.
+  const withAppliedStamp = (p, applied) => applied
+    ? { ...p, applied: true, appliedAt: p.appliedAt || new Date().toISOString() }
+    : { ...p, applied: false, appliedAt: undefined };
   const addPrepayment = () => {
     if (!prepForm.amount || parseFloat(prepForm.amount) <= 0) return;
-    setPrepayments([...prepayments, { ...prepForm, id: Date.now() }]);
+    setPrepayments([...prepayments, withAppliedStamp({ ...prepForm, id: Date.now() }, prepForm.applied)]);
   };
   const removePrepayment = (id) => setPrepayments(prepayments.filter(p => p.id !== id));
-  const updatePrepayment = (id, updates) => setPrepayments(prepayments.map(p =>
-    p.id === id ? { ...p, ...updates } : p
-  ));
+  const updatePrepayment = (id, updates) => setPrepayments(prepayments.map(p => {
+    if (p.id !== id) return p;
+    const next = { ...p, ...updates };
+    return 'applied' in updates ? withAppliedStamp(next, updates.applied) : next;
+  }));
   const toggleApplied = (id) => setPrepayments(prepayments.map(p =>
-    p.id === id ? { ...p, applied: !p.applied } : p
+    p.id === id ? withAppliedStamp(p, !p.applied) : p
   ));
   const clearPrepayments = () => setPrepayments([]);
 
   const resetAll = () => {
-    setOutstanding(autoState.outstanding);
+    // Fresh prepay-free roll at reset time (not the mount-time one - the tab may have been
+    // open across an EMI date).
+    setOutstanding(getAutoState([], ORIG.inferredRate, ORIG.currentEMI).outstanding);
     setAnnualRate(ORIG.inferredRate);
     setEmi(ORIG.currentEMI);
-    setRemainingMonths(autoState.remainingTenure);
+    setRemainingMonths(ORIG.remainingTenure);
     setPrepayMode('reduce_tenure');
     setPrepayments([]);
   };
@@ -546,6 +589,10 @@ const Dashboard = () => {
     version: 1,
     snapshotVersion: SNAPSHOT_VERSION,
     savedAt: new Date().toISOString(),
+    // When the outstanding figure was last actually true (mount / manual edit / restore) -
+    // NOT the push time. A tab left open across the 10th pushes a pre-EMI balance; stamping
+    // it with push time would make every later restore skip that EMI forever.
+    balanceAsOf: new Date(balanceAsOfRef.current).toISOString(),
     outstanding,
     annualRate,
     emi,
@@ -554,52 +601,65 @@ const Dashboard = () => {
     prepayments
   });
 
-  // A saved `outstanding` is only true on the day it was saved. Restoring it verbatim used to
+  // A saved `outstanding` is only true as of its balanceAsOf. Restoring it verbatim used to
   // FREEZE the balance: EMIs deducted on the 10th were overwritten by the old figure on every
-  // load (the bug that kept the dashboard at the save-time balance). So on restore, deduct the
-  // EMIs whose due dates fell after the save — same maths as getAutoState.
-  const applyEmisSince = (value, savedAtIso) => {
-    const savedAt = new Date(savedAtIso || 0);
-    const now = new Date();
-    const monthlyRate = ORIG.inferredRate / 12 / 100;
-    let out = value;
-    let cursor = new Date(ORIG.snapshotNextDue);
-    while (cursor.getTime() <= now.getTime()) {
-      if (cursor.getTime() > savedAt.getTime() && out > 0.5) {
-        const interest = out * monthlyRate;
-        let principal = Math.min(ORIG.currentEMI - interest, out);
-        if (principal < 0) principal = 0;
-        out -= principal;
-      }
-      cursor = addMonths(cursor, 1);
-    }
-    return out;
-  };
+  // load. So on restore, deduct the EMIs due after balanceAsOf - charging interest on the true
+  // balance (net of the restored applied prepayments) at the restored rate/EMI.
+  const applyEmisSince = (value, asOfIso, preps, rate, emiAmount) =>
+    rollEmis(value, new Date(asOfIso || 0).getTime(), preps, rate, emiAmount).outstanding;
 
+  // Returns a payload to self-heal the cloud copy with (version-mismatch case), else null.
   const applyData = (data) => {
-    if (!data || typeof data !== 'object') return;
+    if (!data || typeof data !== 'object') return null;
     if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
     if (data.snapshotVersion === SNAPSHOT_VERSION) {
       // Cloud copy is from the current snapshot era — restore it, then roll the balance
-      // forward past any EMI dates that have passed since it was saved.
-      if (typeof data.outstanding === 'number') setOutstanding(applyEmisSince(data.outstanding, data.savedAt));
+      // forward past any EMI dates that have passed since it was last true.
+      const preps = Array.isArray(data.prepayments) ? data.prepayments : [];
+      if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
       if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
       if (typeof data.emi === 'number') setEmi(data.emi);
       if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
-      if (Array.isArray(data.prepayments)) setPrepayments(data.prepayments);
-      return;
+      if (typeof data.outstanding === 'number') {
+        setOutstandingRaw(applyEmisSince(
+          data.outstanding,
+          data.balanceAsOf || data.savedAt,
+          preps,
+          typeof data.annualRate === 'number' ? data.annualRate : undefined,
+          typeof data.emi === 'number' ? data.emi : undefined
+        ));
+        balanceAsOfRef.current = Date.now(); // rolled to now
+      }
+      return null;
     }
     // Cloud copy predates the latest bank-snapshot refresh ("work backwards" rule):
     // the refreshed ORIG outstanding is the source of truth for the CURRENT balance,
     // so stale loan figures are ignored, and prepayments already marked "applied"
     // are dropped — their effect is baked into the new outstanding. Future planned
     // prepayments are pure simulation inputs, so they are kept. No plans are lost.
-    if (Array.isArray(data.prepayments)) {
-      setPrepayments(data.prepayments.filter((p) => !p.applied));
-    }
+    const kept = Array.isArray(data.prepayments) ? data.prepayments.filter((p) => !p.applied) : [];
+    setPrepayments(kept);
+    // Build the healed payload HERE, from the pulled data - calling collectData() from the
+    // self-heal timeout would serialize the mount render's stale state (empty prepayments)
+    // and wipe the kept plans from the Gist.
+    const fresh = getAutoState(kept, ORIG.inferredRate, ORIG.currentEMI);
+    return {
+      version: 1,
+      snapshotVersion: SNAPSHOT_VERSION,
+      savedAt: new Date().toISOString(),
+      balanceAsOf: new Date().toISOString(),
+      outstanding: fresh.outstanding,
+      annualRate: ORIG.inferredRate,
+      emi: ORIG.currentEMI,
+      remainingMonths: fresh.remainingTenure,
+      prepayMode: typeof data.prepayMode === 'string' ? data.prepayMode : 'reduce_tenure',
+      prepayments: kept
+    };
   };
 
-  const pushToGist = async (cfg) => {
+  // `payload` overrides collectData() - used by the self-heal push, which must send the
+  // just-migrated data rather than whatever state this render closure captured.
+  const pushToGist = async (cfg, payload) => {
     const c = cfg || gistConfig;
     if (!c.gistId || !c.token) {
       setSyncMessage('Gist ID and token required');
@@ -617,7 +677,7 @@ const Dashboard = () => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          files: { [GIST_FILENAME]: { content: JSON.stringify(collectData(), null, 2) } }
+          files: { [GIST_FILENAME]: { content: JSON.stringify(payload || collectData(), null, 2) } }
         })
       });
       if (!res.ok) {
@@ -660,20 +720,21 @@ const Dashboard = () => {
       if (!fileObj) {
         setSyncMessage(`No ${GIST_FILENAME} in Gist yet — push first`);
         setSyncStatus('idle');
-        return false;
+        return 'empty';
       }
       const content = fileObj.content || '{}';
       const data = JSON.parse(content);
       if (!data || Object.keys(data).length === 0) {
         setSyncMessage('Gist is empty — push first');
         setSyncStatus('idle');
-        return false;
+        return 'empty';
       }
-      applyData(data);
-      if (data.snapshotVersion !== SNAPSHOT_VERSION) {
-        // One-time self-heal: the cloud copy predates the snapshot refresh, so push
-        // freshly-stamped data back up — every device converges on the new balance.
-        setTimeout(() => pushToGist(c), 1500);
+      const healed = applyData(data);
+      if (healed) {
+        // One-time self-heal: the cloud copy predates the snapshot refresh - push the exact
+        // migrated payload back up so every device converges on the new balance. (Never via
+        // collectData here: this closure's state predates the restore.)
+        setTimeout(() => pushToGist(c, healed), 1500);
       }
       setSyncStatus('synced');
       setLastSync(new Date());
@@ -686,11 +747,14 @@ const Dashboard = () => {
     }
   };
 
-  // On mount: if configured, pull once
+  // On mount: if configured, pull once. Auto-save only unlocks after a SUCCESSFUL pull (or a
+  // reachable-but-empty Gist) - a failed pull followed by one edit used to overwrite the cloud
+  // copy with this device's defaults.
   useEffect(() => {
     if (gistConfig.gistId && gistConfig.token && !hasPulled) {
-      setHasPulled(true);
-      pullFromGist(gistConfig);
+      pullFromGist(gistConfig).then((result) => {
+        if (result === true || result === 'empty') setHasPulled(true);
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
