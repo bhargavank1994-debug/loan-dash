@@ -393,7 +393,7 @@ const Dashboard = () => {
   const autoState = useMemo(() => getAutoState(prepayments, annualRate, emi), [prepayments, annualRate, emi]);
   const [editingId, setEditingId] = useState(null);
   const [showTable, setShowTable] = useState(true);
-  const [tableView, setTableView] = useState('monthly'); // monthly default
+  const [tableView, setTableView] = useState('full'); // the complete ledger, day one to close
 
   // ===== Cloud sync via GitHub Gist =====
   const GIST_FILENAME = 'loan_dashboard.json';
@@ -477,6 +477,36 @@ const Dashboard = () => {
   const interestSaved = baseline.totalInterest - optimized.totalInterest;
   const monthsSaved = baseline.finalMonth - optimized.finalMonth;
   const yearsSaved = (monthsSaved / 12).toFixed(1);
+
+  // One continuous ledger from disbursement day to the last EMI: the bank's posted rows
+  // verbatim (EMIs, prepayments, rate-change capitalisations), a TODAY divider, then the
+  // simulated future. EMI numbering runs straight through (44 posted + the projection).
+  const fullLedger = useMemo(() => {
+    const rows = [{ kind: 'disb', date: ORIG.disbursedDate, rate: BANK_LEDGER[0][2], balance: ORIG.loanAmount }];
+    let n = 0;
+    for (const [d, t, rate, total, principal, interest, balance] of BANK_LEDGER) {
+      if (t === 'D') continue;
+      const date = new Date(d + 'T00:00:00');
+      if (t === 'E') { n++; rows.push({ kind: 'emi', posted: true, n, date, rate, emi: total, interest, principal, prepay: 0, balance }); }
+      else if (t === 'R') rows.push({ kind: 'prepay', posted: true, date, rate, prepay: total, balance });
+      else rows.push({ kind: 'adj', posted: true, date, rate, interest, principal, balance });
+    }
+    rows.push({ kind: 'today', date: today, balance: adjusted.outstanding });
+    optimized.schedule.forEach((r) => {
+      n++;
+      rows.push({ kind: 'emi', posted: false, n, date: monthToDate(r.month), rate: annualRate, emi: r.emi, interest: r.interest, principal: r.principal, prepay: r.prepayment || 0, balance: r.balance });
+    });
+    return rows;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [optimized, annualRate, adjusted.outstanding]);
+
+  // Whole-life totals across the full ledger (posted + simulated).
+  const ledgerTotals = useMemo(() => fullLedger.reduce((a, r) => {
+    if (r.kind === 'emi') { a.emi += r.emi; a.interest += r.interest; a.principal += r.principal; a.prepay += r.prepay || 0; }
+    else if (r.kind === 'prepay') a.prepay += r.prepay;
+    else if (r.kind === 'adj') { a.interest += r.interest; a.principal += r.principal; }
+    return a;
+  }, { emi: 0, interest: 0, principal: 0, prepay: 0 }), [fullLedger]);
 
   // Guidance: what ONE lakh prepaid right now buys you (interest saved + months cut)
   const lakhImpact = useMemo(() => {
@@ -1451,8 +1481,9 @@ const Dashboard = () => {
             </h2>
             <div className="flex gap-2">
               <select value={tableView} onChange={(e) => setTableView(e.target.value)} className="text-[11px] border border-slate-200 rounded-sm px-1.5 py-0.5 bg-white">
-                <option value="monthly">Monthly</option>
-                <option value="yearly">Yearly</option>
+                <option value="full">Full ledger · day one to close</option>
+                <option value="monthly">Future · monthly</option>
+                <option value="yearly">Future · yearly</option>
               </select>
               <button onClick={() => setShowTable(!showTable)} className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1">
                 {showTable ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
@@ -1491,12 +1522,13 @@ const Dashboard = () => {
           </div>
 
           {showTable && (
-            <div className="overflow-x-auto max-h-80 overflow-y-auto mt-2 border-t border-slate-100">
+            <div className="overflow-x-auto max-h-96 overflow-y-auto mt-2 border-t border-slate-100">
               <table className="w-full text-[11px]">
-                <thead className="sticky top-0 bg-slate-50">
+                <thead className="sticky top-0 bg-slate-50 z-10">
                   <tr className="text-left">
                     <th className="py-1.5 px-2 font-semibold text-slate-600">{tableView === 'yearly' ? 'Yr' : '#'}</th>
                     <th className="py-1.5 px-2 font-semibold text-slate-600">Date</th>
+                    {tableView === 'full' && <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Rate</th>}
                     <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">EMI</th>
                     <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Interest</th>
                     <th className="py-1.5 px-2 font-semibold text-slate-600 text-right">Principal</th>
@@ -1505,7 +1537,75 @@ const Dashboard = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {tableView === 'monthly'
+                  {tableView === 'full'
+                    ? (<>
+                        {fullLedger.map((r, i) => {
+                          if (r.kind === 'disb') return (
+                            <tr key={i} className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                              <td className="py-1 px-2">—</td>
+                              <td className="py-1 px-2 font-medium">{fmtFullDate(r.date)} · Disbursed (5 tranches)</td>
+                              <td className="py-1 px-2 text-right">{r.rate.toFixed(2)}%</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right font-semibold">{formatINR(r.balance)}</td>
+                            </tr>
+                          );
+                          if (r.kind === 'today') return (
+                            <tr key={i} className="border-y-2 border-indigo-300 bg-indigo-50 text-indigo-800">
+                              <td colSpan={8} className="py-1 px-2 text-[10px] font-bold uppercase tracking-wider">
+                                Today · {fmtFullDate(r.date)} · balance {formatINR(r.balance)} — everything above is the bank record, everything below is simulated
+                              </td>
+                            </tr>
+                          );
+                          if (r.kind === 'prepay') return (
+                            <tr key={i} className="border-b border-emerald-100 bg-emerald-50/70">
+                              <td className="py-1 px-2 text-emerald-700 font-bold">✓</td>
+                              <td className="py-1 px-2 text-emerald-800 font-medium">{fmtFullDate(r.date)} · Prepayment</td>
+                              <td className="py-1 px-2 text-right text-slate-500">{r.rate.toFixed(2)}%</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right text-emerald-700 font-bold">{formatINR(r.prepay)}</td>
+                              <td className="py-1 px-2 text-right font-semibold">{formatINR(r.balance)}</td>
+                            </tr>
+                          );
+                          if (r.kind === 'adj') return (
+                            <tr key={i} className="border-b border-amber-100 bg-amber-50/70">
+                              <td className="py-1 px-2 text-amber-600">±</td>
+                              <td className="py-1 px-2 text-amber-800">{fmtFullDate(r.date)} · Rate-change interest capitalised</td>
+                              <td className="py-1 px-2 text-right text-slate-500">{r.rate.toFixed(2)}%</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right text-amber-700">{formatINR(r.interest)}</td>
+                              <td className="py-1 px-2 text-right text-rose-600">{formatINR(r.principal)}</td>
+                              <td className="py-1 px-2 text-right">—</td>
+                              <td className="py-1 px-2 text-right font-medium">{formatINR(r.balance)}</td>
+                            </tr>
+                          );
+                          return (
+                            <tr key={i} className={`border-b border-slate-100 hover:bg-slate-50 ${r.posted ? '' : 'bg-indigo-50/30'}`}>
+                              <td className={`py-1 px-2 ${r.posted ? 'text-slate-500' : 'text-indigo-500'}`}>{r.n}{r.posted && <span className="text-emerald-600"> ✓</span>}</td>
+                              <td className="py-1 px-2">{fmtMY(r.date)}</td>
+                              <td className="py-1 px-2 text-right text-slate-500">{r.rate.toFixed(2)}%</td>
+                              <td className="py-1 px-2 text-right">{formatINR(r.emi)}</td>
+                              <td className="py-1 px-2 text-right text-amber-700">{formatINR(r.interest)}</td>
+                              <td className="py-1 px-2 text-right text-emerald-700">{formatINR(r.principal)}</td>
+                              <td className="py-1 px-2 text-right text-indigo-700 font-medium">{r.prepay > 0 ? formatINR(r.prepay) : '—'}</td>
+                              <td className="py-1 px-2 text-right font-medium">{formatINR(r.balance)}</td>
+                            </tr>
+                          );
+                        })}
+                        <tr className="border-t-2 border-slate-300 bg-slate-100 font-semibold text-slate-800">
+                          <td className="py-1.5 px-2" colSpan={3}>Whole loan · EMIs + prepayments</td>
+                          <td className="py-1.5 px-2 text-right">{formatINR(ledgerTotals.emi)}</td>
+                          <td className="py-1.5 px-2 text-right text-amber-700">{formatINR(ledgerTotals.interest)}</td>
+                          <td className="py-1.5 px-2 text-right text-emerald-700">{formatINR(ledgerTotals.principal)}</td>
+                          <td className="py-1.5 px-2 text-right text-indigo-700">{formatINR(ledgerTotals.prepay)}</td>
+                          <td className="py-1.5 px-2 text-right">₹0</td>
+                        </tr>
+                      </>)
+                    : tableView === 'monthly'
                     ? optimized.schedule.map(r => (
                       <tr key={r.month} className="border-b border-slate-100 hover:bg-slate-50">
                         <td className="py-1 px-2 text-slate-500">{r.month}</td>
