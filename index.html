@@ -478,6 +478,22 @@ const Dashboard = () => {
   const monthsSaved = baseline.finalMonth - optimized.finalMonth;
   const yearsSaved = (monthsSaved / 12).toFixed(1);
 
+  // Interest per Indian financial year: the bank's posted figures plus the simulation's
+  // projection for the years still to come (reflects planned prepayments as entered).
+  const fyInterest = useMemo(() => {
+    const fyOf = (d) => { const y = d.getFullYear(); const s = d.getMonth() + 1 >= 4 ? y : y - 1; return `FY ${s}-${String((s + 1) % 100).padStart(2, '0')}`; };
+    const map = new Map();
+    BANK_FY_INTEREST.forEach((f) => map.set(f.fy, { posted: f.interest, projected: 0 }));
+    optimized.schedule.forEach((r) => {
+      const label = fyOf(monthToDate(r.month));
+      const e = map.get(label) || { posted: 0, projected: 0 };
+      e.projected += r.interest;
+      map.set(label, e);
+    });
+    return [...map.entries()].map(([fy, v]) => ({ fy, ...v, total: v.posted + v.projected }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [optimized]);
+
   // One continuous ledger from disbursement day to the last EMI: the bank's posted rows
   // verbatim (EMIs, prepayments, rate-change capitalisations), a TODAY divider, then the
   // simulated future. EMI numbering runs straight through (44 posted + the projection).
@@ -1498,26 +1514,33 @@ const Dashboard = () => {
           <div className="bg-white rounded-lg border border-slate-200 p-3">
             <h2 className="text-sm font-semibold flex items-center gap-1.5 mb-2">
               <Calendar size={14} className="text-slate-400" /> Interest by Financial Year
-              <span className="text-[10px] font-normal text-slate-400">for tax (Sec 24b) · posted only</span>
+              <span className="text-[10px] font-normal text-slate-400">for tax (Sec 24b) · posted + upcoming</span>
             </h2>
             <div className="overflow-hidden rounded-md border border-slate-200">
               <table className="w-full text-[11px]">
                 <thead className="bg-slate-50">
                   <tr>
                     <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Year</th>
-                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Interest paid</th>
-                    <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500 w-1/3"></th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Paid</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-indigo-500">Upcoming</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Total</th>
+                    <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500 w-1/4"></th>
                   </tr>
                 </thead>
                 <tbody>
                   {(() => {
-                    const max = Math.max(...BANK_FY_INTEREST.map((f) => f.interest));
-                    return BANK_FY_INTEREST.map((f) => (
+                    const max = Math.max(...fyInterest.map((f) => f.total));
+                    return fyInterest.map((f) => (
                       <tr key={f.fy} className="border-t border-slate-100">
-                        <td className="py-1 px-2 text-slate-600">{f.fy}{f.partial && <span className="ml-1 text-[9px] text-slate-400">(so far)</span>}</td>
-                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{formatINR(f.interest)}</td>
+                        <td className="py-1 px-2 text-slate-600">{f.fy}</td>
+                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{f.posted > 0 ? formatINR(f.posted) : <span className="text-slate-300">—</span>}</td>
+                        <td className="py-1 px-2 text-right text-indigo-600">{f.projected > 0 ? `~${formatINR(f.projected)}` : <span className="text-slate-300">—</span>}</td>
+                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{formatINR(f.total)}</td>
                         <td className="py-1 px-2">
-                          <div className="h-1.5 rounded bg-amber-400" style={{ width: `${Math.max(3, (f.interest / max) * 100)}%` }} />
+                          <div className="flex h-1.5 rounded overflow-hidden bg-slate-100">
+                            {f.posted > 0 && <div className="bg-amber-400" style={{ width: `${(f.posted / max) * 100}%` }} />}
+                            {f.projected > 0 && <div className="bg-indigo-400" style={{ width: `${(f.projected / max) * 100}%` }} />}
+                          </div>
                         </td>
                       </tr>
                     ));
@@ -1525,14 +1548,17 @@ const Dashboard = () => {
                   <tr className="border-t border-slate-200 bg-slate-50">
                     <td className="py-1 px-2 font-semibold text-slate-700">Total</td>
                     <td className="py-1 px-2 text-right font-bold text-amber-700">{formatINR(ORIG.paidInterest)}</td>
-                    <td className="py-1 px-2 text-[10px] text-slate-400">exact, from the bank</td>
+                    <td className="py-1 px-2 text-right font-bold text-indigo-700">~{formatINR(optimized.totalInterest)}</td>
+                    <td className="py-1 px-2 text-right font-bold text-slate-800">{formatINR(ORIG.paidInterest + optimized.totalInterest)}</td>
+                    <td className="py-1 px-2 text-[10px] text-slate-400">whole loan</td>
                   </tr>
                 </tbody>
               </table>
             </div>
             <p className="text-[10px] text-slate-400 mt-1.5 leading-snug">
-              Interest is falling fast as the balance shrinks: the bank projects only {formatINR(674311, { compact: true })} more
-              across the remaining {ORIG.remainingTenure} EMIs — and planned prepayments cut that further.
+              Paid (amber) is exact from the bank. Upcoming (indigo) is the live simulation at {annualRate}%, including your
+              planned prepayments — with none, the bank's own projection is {formatINR(674311, { compact: true })} across the
+              remaining {ORIG.remainingTenure} EMIs. Sec 24b lets you claim up to ₹2L of self-occupied home-loan interest per FY.
             </p>
           </div>
         </div>
