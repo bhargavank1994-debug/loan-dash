@@ -74,29 +74,157 @@ const fmtL = (num) => {
 };
 
 // ============ STATIC LOAN DATA ============
-// Snapshot refreshed 3 Aug 2026 from the bank: outstanding ₹41L exactly, stated as of today.
-// This figure is the balance BEFORE the Aug 10 2026 EMI (snapshotNextDue = Aug 10). The ₹8.0L
-// drop since the Jun snapshot = the Jul 10 EMI principal (~₹0.7L) + ~₹7.3L of prepayment.
+// Snapshot v5, taken verbatim from the Kotak repayment schedule pulled 3 Aug 2026
+// (2026-08-03-08-57-50-Schedule_Full_Tenure.pdf). Every figure below is the bank's, not an
+// estimate: outstanding ₹41,27,817 after the 10 Jul 2026 EMI posted, exact interest paid,
+// exact prepayment history (BANK_PREPAYMENTS), exact rate history (BANK_RATE_HISTORY).
 // Bump SNAPSHOT_VERSION whenever ORIG is refreshed from the bank: cloud-synced params
 // saved under an older version are ignored for loan figures, so a stale Gist can never
-// overwrite a corrected balance (prepayment plans still restore).
-const SNAPSHOT_VERSION = 4;
+// overwrite a corrected balance (prepayment plans still restore, applied ones are dropped
+// because they are baked into the refreshed balance).
+const SNAPSHOT_VERSION = 5;
 const ORIG = {
   loanAmount: 11366000,
-  paidPrincipal: 7266000,        // = original loan − ₹41L outstanding
-  paidInterest: 3012735,         // cumulative interest paid to date (≈, prev 2980885 + Jul EMI ≈31850 @7.8%)
-  paidTotal: 10278735,
-  outstandingPrincipal: 4100000, // ₹41L — bank balance 3 Aug 2026, before the Aug EMI
-  totalTenure: 91,               // 44 paid + ~47 remaining at current EMI
+  paidPrincipal: 7238183,        // = 11,366,000 − 41,27,817 (₹14.88L via EMIs + ₹57.5L prepaid)
+  paidInterest: 3006212,         // EXACT sum of the interest column, Dec 2022 .. 10 Jul 2026
+  paidTotal: 10244395,
+  outstandingPrincipal: 4127817, // bank closing balance after the 10 Jul 2026 EMI
+  totalTenure: 91,               // 44 paid + 47 in the bank's own projection
   monthsPaid: 44,
-  remainingTenure: 47,           // 41L @ 7.95% with EMI 102,408 amortizes in ~47 months
+  remainingTenure: 47,           // bank projects 47 EMIs: Aug 2026 .. 10 Jun 2030 (last ₹91,359)
   currentEMI: 102408,
   agreementDate: new Date(2022, 1, 17),
+  disbursedDate: new Date(2022, 10, 10), // 10 Nov 2022, five tranches totalling ₹1.14Cr
   firstEMIDate: new Date(2022, 11, 10),
-  maturityDate: new Date(2030, 5, 10), // ~Jun 2030: 47th EMI counted from Aug 10 2026
-  snapshotNextDue: new Date(2026, 7, 10), // Aug 10 2026 (next EMI) — keeps balance at ₹41L until then
-  inferredRate: 7.8 // confirmed from the bank Aug 2026 (was 7.95 inferred). No SNAPSHOT_VERSION bump: the balance anchor is unchanged, and same-era saves carry the user's rate anyway.
+  maturityDate: new Date(2030, 5, 10),   // bank's projected close: 10 Jun 2030
+  finalEMI: 91359,                       // the last, partial EMI per the bank schedule
+  snapshotNextDue: new Date(2026, 7, 10), // Aug 10 2026 — balance stays ₹41,27,817 until then
+  inferredRate: 7.8 // bank rate since 31 Jan 2026 (see BANK_RATE_HISTORY)
 };
+
+// ============ BANK RECORD (facts, not simulation) ============
+// Lump-sum prepayments already MADE, from the bank schedule. These are inside
+// ORIG.outstandingPrincipal already - they are displayed as fixed history with the balance
+// each one left behind, and are never fed to the simulator. Planned prepayments (the
+// editable list in the UI) are the only simulation inputs.
+const BANK_PREPAYMENTS = [
+  { date: '2024-02-01', amount: 500000,  balanceAfter: 10611954 },
+  { date: '2024-04-12', amount: 500000,  balanceAfter: 10046905 },
+  { date: '2024-05-13', amount: 500000,  balanceAfter: 9520476 },
+  { date: '2024-07-18', amount: 450000,  balanceAfter: 9009348 },
+  { date: '2025-11-05', amount: 500000,  balanceAfter: 7933744 },
+  { date: '2026-01-31', amount: 600000,  balanceAfter: 7187995 },
+  { date: '2026-04-15', amount: 500000,  balanceAfter: 6522741 },
+  { date: '2026-05-14', amount: 1000000, balanceAfter: 5463216 },
+  { date: '2026-06-24', amount: 500000,  balanceAfter: 4897129 },
+  { date: '2026-07-09', amount: 700000,  balanceAfter: 4197129 },
+];
+const BANK_PREPAID_TOTAL = 5750000;
+
+// Rate and EMI as actually charged, per the bank schedule.
+const BANK_RATE_HISTORY = [
+  { from: '2022-12-10', rate: 8.45, emi: 99323 },
+  { from: '2023-02-10', rate: 8.80, emi: 100612 },
+  { from: '2023-05-10', rate: 9.05, emi: 102408 },
+  { from: '2025-05-10', rate: 8.55, emi: 102408 },
+  { from: '2025-08-10', rate: 8.05, emi: 102408 },
+  { from: '2026-01-31', rate: 7.80, emi: 102408 },
+];
+
+// Interest actually charged per Indian financial year (posted rows only; FY26-27 is partial).
+// Includes the two rate-change capitalisations of early 2023 (₹15,438 + ₹16,001).
+const BANK_FY_INTEREST = [
+  { fy: 'FY 2022-23', interest: 325341 },
+  { fy: 'FY 2023-24', interest: 1005230 },
+  { fy: 'FY 2024-25', interest: 836372 },
+  { fy: 'FY 2025-26', interest: 680955 },
+  { fy: 'FY 2026-27', interest: 158314, partial: true },
+];
+
+// What the prepayments actually bought, computed by replaying the bank's own rate/EMI history
+// WITHOUT the ten prepayments (tenure extends at fixed EMI, exactly how banks absorb rate
+// hikes): the loan would still be running until Jun 2040 and cost ₹1.02Cr in interest.
+const BANK_NO_PREPAY = { closes: 'Jun 2040', months: 211, totalInterest: 10165271 };
+const BANK_WITH_PREPAY = { closes: 'Jun 2030', months: 91, totalInterest: 3680523 }; // paid 30.06L + bank-projected 6.74L
+const BANK_INTEREST_SAVED = 6484748;
+
+// Every posted row: [date, type(D=disbursement, E=EMI, A=rate-change interest capitalisation,
+// R=prepayment), rate, total, principal, interest, closingBalance]. Drives the actual balance
+// path in the Loan Journey and anything else that wants history.
+const BANK_LEDGER = [
+  ["2022-11-10","D",8.45,-4850000,-4850000,0,4850000],
+  ["2022-11-10","D",8.45,-2500000,-2500000,0,7350000],
+  ["2022-11-10","D",8.45,-1500000,-1500000,0,8850000],
+  ["2022-11-10","D",8.45,-1500000,-1500000,0,10350000],
+  ["2022-11-10","D",8.45,-1016000,-1016000,0,11366000],
+  ["2022-12-10","E",8.45,99323,19287,80036,11346713],
+  ["2023-01-10","E",8.45,99323,19423,79900,11327289],
+  ["2023-01-16","A",8.45,0,-15438,15438,11342727],
+  ["2023-02-10","E",8.8,100612,33579,67033,11309149],
+  ["2023-03-10","E",8.8,100612,17678,82934,11291470],
+  ["2023-04-10","E",8.8,100612,17808,82804,11273662],
+  ["2023-04-16","A",8.8,0,-16001,16001,11289664],
+  ["2023-05-10","E",9.05,102408,33794,68614,11255869],
+  ["2023-06-10","E",9.05,102408,17520,84888,11238349],
+  ["2023-07-10","E",9.05,102408,17652,84756,11220697],
+  ["2023-08-10","E",9.05,102408,17785,84623,11202912],
+  ["2023-09-10","E",9.05,102408,17919,84489,11184993],
+  ["2023-10-10","E",9.05,102408,18055,84353,11166938],
+  ["2023-11-10","E",9.05,102408,18191,84217,11148747],
+  ["2023-12-10","E",9.05,102408,18328,84080,11130420],
+  ["2024-01-10","E",9.05,102408,18466,83942,11111954],
+  ["2024-02-01","R",9.05,500000,500000,0,10611954],
+  ["2024-02-10","E",9.05,102408,19827,82581,10592127],
+  ["2024-03-10","E",9.05,102408,22526,79882,10569601],
+  ["2024-04-10","E",9.05,102408,22696,79712,10546905],
+  ["2024-04-12","R",9.05,500000,500000,0,10046905],
+  ["2024-05-10","E",9.05,102408,26430,75978,10020476],
+  ["2024-05-13","R",9.05,500000,500000,0,9520476],
+  ["2024-06-10","E",9.05,102408,30291,72117,9490185],
+  ["2024-07-10","E",9.05,102408,30836,71572,9459348],
+  ["2024-07-18","R",9.05,450000,450000,0,9009348],
+  ["2024-08-10","E",9.05,102408,33687,68721,8975662],
+  ["2024-09-10","E",9.05,102408,34717,67691,8940945],
+  ["2024-10-10","E",9.05,102408,34978,67430,8905967],
+  ["2024-11-10","E",9.05,102408,35242,67166,8870724],
+  ["2024-12-10","E",9.05,102408,35508,66900,8835216],
+  ["2025-01-10","E",9.05,102408,35776,66632,8799441],
+  ["2025-02-10","E",9.05,102408,36046,66362,8763395],
+  ["2025-03-10","E",9.05,102408,36317,66091,8727078],
+  ["2025-04-10","E",9.05,102408,36591,65817,8690486],
+  ["2025-05-10","E",8.55,102408,39860,62548,8650626],
+  ["2025-06-10","E",8.55,102408,40772,61636,8609854],
+  ["2025-07-10","E",8.55,102408,41063,61345,8568791],
+  ["2025-08-10","E",8.05,102408,44298,58110,8524493],
+  ["2025-09-10","E",8.05,102408,45223,57185,8479270],
+  ["2025-10-10","E",8.05,102408,45526,56882,8433744],
+  ["2025-11-05","R",8.05,500000,500000,0,7933744],
+  ["2025-11-10","E",8.05,102408,46422,55986,7887321],
+  ["2025-12-10","E",8.05,102408,49497,52911,7837824],
+  ["2026-01-10","E",8.05,102408,49829,52579,7787995],
+  ["2026-01-31","R",7.8,600000,600000,0,7187995],
+  ["2026-02-10","E",7.8,102408,52831,49577,7135164],
+  ["2026-03-10","E",7.8,102408,56029,46379,7079134],
+  ["2026-04-10","E",7.8,102408,56394,46014,7022741],
+  ["2026-04-15","R",7.8,500000,500000,0,6522741],
+  ["2026-05-10","E",7.8,102408,59525,42883,6463216],
+  ["2026-05-14","R",7.8,1000000,1000000,0,5463216],
+  ["2026-06-10","E",7.8,102408,66087,36321,5397129],
+  ["2026-06-24","R",7.8,500000,500000,0,4897129],
+  ["2026-07-09","R",7.8,700000,700000,0,4197129],
+  ["2026-07-10","E",7.8,102408,69312,33096,4127817]
+];
+
+// True balance on any past date, straight from the ledger.
+function bankBalanceAt(date) {
+  const iso = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  let bal = null;
+  for (const row of BANK_LEDGER) {
+    if (row[0] <= iso) bal = row[6];
+    else break;
+  }
+  return bal === null ? ORIG.loanAmount : bal;
+}
 
 // ============ AMORTIZATION ENGINE ============
 function computeSchedule({
@@ -420,16 +548,14 @@ const Dashboard = () => {
     return out;
   }, []);
 
-  // Year-end markers — Simulated (interpolate past, schedule for future)
+  // Year-end markers — Simulated (bank ledger for the past, schedule for the future)
   const simulatedYearMarkers = useMemo(() => {
     const compute = (date) => {
       if (date <= ORIG.firstEMIDate) return ORIG.loanAmount;
       if (date <= today) {
-        // Linear interpolate past from start to today
-        const totalMs = today.getTime() - ORIG.firstEMIDate.getTime();
-        const elapsedMs = date.getTime() - ORIG.firstEMIDate.getTime();
-        const ratio = totalMs > 0 ? elapsedMs / totalMs : 0;
-        return Math.max(0, ORIG.loanAmount - ratio * (ORIG.loanAmount - adjusted.outstanding));
+        // The real balance path from the bank ledger - shows the actual prepayment cliffs
+        // instead of a straight line.
+        return bankBalanceAt(date);
       }
       // Future from optimized schedule
       const monthsAhead = (date.getFullYear() - firstFutureDate.getFullYear()) * 12 +
@@ -779,7 +905,7 @@ const Dashboard = () => {
             <div>
               <h1 className="text-sm md:text-base font-bold leading-tight">Home Loan Explorer</h1>
               <p className="text-[10px] text-slate-500">
-                HF-38876546 · ₹{formatINR(ORIG.loanAmount, { compact: true, showSymbol: false })} · 124 mo · agreement {fmtFullDate(ORIG.agreementDate)} · today {fmtFullDate(today)}
+                Kotak · HF-38876546 · ₹{formatINR(ORIG.loanAmount, { compact: true, showSymbol: false })} disbursed {fmtMY(ORIG.disbursedDate)} · today {fmtFullDate(today)}
               </p>
             </div>
           </div>
@@ -977,7 +1103,7 @@ const Dashboard = () => {
             <Stat label="Already paid" value={formatINR(adjusted.paidTotal, { compact: true })} sub={`P:${formatINR(adjusted.paidPrincipal, { compact: true })} · I:${formatINR(adjusted.paidInterest, { compact: true })}`} />
             <Stat label="Outstanding" value={formatINR(adjusted.outstanding, { compact: true })} sub={`Next EMI: ${fmtFullDate(firstFutureDate)}`} highlight={appliedSum > 0 || autoState.autoCount > 0} />
             <Stat label="Current EMI" value={formatINR(emi, { compact: true })} sub={`@ ${annualRate}% p.a.`} />
-            <Stat label="Original maturity" value={fmtMY(ORIG.maturityDate)} sub={`${ORIG.totalTenure - adjusted.monthsPaid} months remaining`} />
+            <Stat label="Bank maturity" value={fmtMY(ORIG.maturityDate)} sub={`${ORIG.totalTenure - adjusted.monthsPaid} EMIs left · last ${formatINR(ORIG.finalEMI, { compact: true })}`} />
           </div>
         </div>
 
@@ -1021,6 +1147,61 @@ const Dashboard = () => {
                 <button onClick={clearPrepayments} className="text-[10px] text-rose-600 hover:underline">Clear all</button>
               )}
             </div>
+
+            {/* MADE — fixed facts from the bank record. Not editable, never simulated:
+                every rupee below is already inside the current outstanding balance. */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700 flex items-center gap-1">
+                  <Check size={11} strokeWidth={3} /> Made · from the bank record
+                </p>
+                <span className="text-[10px] text-slate-500">{BANK_PREPAYMENTS.length} payments · fixed</span>
+              </div>
+              <div className="bg-emerald-50/60 border border-emerald-200 rounded-md p-2 mb-1.5 text-[11px] text-emerald-900 leading-snug">
+                <b>{formatINR(BANK_PREPAID_TOTAL, { compact: true })} prepaid</b> so far. Replaying the same rates without them,
+                this loan would run until <b>{BANK_NO_PREPAY.closes}</b> ({BANK_NO_PREPAY.months} months) and cost{' '}
+                <b>{formatINR(BANK_NO_PREPAY.totalInterest, { compact: true })}</b> in interest — instead it closes{' '}
+                <b>{BANK_WITH_PREPAY.closes}</b> costing {formatINR(BANK_WITH_PREPAY.totalInterest, { compact: true })}.
+                These payments bought back <b>{Math.round((BANK_NO_PREPAY.months - BANK_WITH_PREPAY.months) / 12 * 10) / 10} years</b> and{' '}
+                <b>{formatINR(BANK_INTEREST_SAVED, { compact: true })}</b> of interest.
+              </div>
+              <div className="overflow-hidden rounded-md border border-slate-200">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Date</th>
+                      <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Amount</th>
+                      <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Balance after</th>
+                      <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {BANK_PREPAYMENTS.map((p) => (
+                      <tr key={p.date} className="border-t border-slate-100">
+                        <td className="py-1 px-2 text-slate-600">{fmtFullDate(new Date(p.date + 'T00:00:00'))}</td>
+                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{formatINR(p.amount, { compact: true })}</td>
+                        <td className="py-1 px-2 text-right text-slate-500">{formatINR(p.balanceAfter, { compact: true })}</td>
+                        <td className="py-1 px-2 text-right">
+                          <span className="inline-flex items-center gap-0.5 text-[9px] uppercase tracking-wide text-emerald-700 bg-emerald-100 px-1 py-0 rounded font-bold" title="In the bank record — already inside the current balance, cannot be edited or removed here">
+                            <Check size={8} strokeWidth={3} /> Paid
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                    <tr className="border-t border-slate-200 bg-slate-50">
+                      <td className="py-1 px-2 font-semibold text-slate-700">Total</td>
+                      <td className="py-1 px-2 text-right font-bold text-emerald-700">{formatINR(BANK_PREPAID_TOTAL, { compact: true })}</td>
+                      <td className="py-1 px-2 text-right text-slate-500">{formatINR(ORIG.outstandingPrincipal, { compact: true })} now</td>
+                      <td></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700 mb-1">
+              Planned · simulation
+            </p>
 
             {/* Add form */}
             <div className="bg-slate-50 rounded-md p-2 border border-slate-100 mb-2">
@@ -1175,6 +1356,90 @@ const Dashboard = () => {
                 </ResponsiveContainer>
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* BANK RECORD — rate history and interest by financial year, straight from the schedule */}
+        <div className="grid lg:grid-cols-2 gap-3">
+          <div className="bg-white rounded-lg border border-slate-200 p-3">
+            <h2 className="text-sm font-semibold flex items-center gap-1.5 mb-2">
+              <Activity size={14} className="text-slate-400" /> Rate History
+              <span className="text-[10px] font-normal text-slate-400">as charged by the bank</span>
+            </h2>
+            <div className="overflow-hidden rounded-md border border-slate-200">
+              <table className="w-full text-[11px]">
+                <thead className="bg-slate-50">
+                  <tr>
+                    <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Effective</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Rate</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">EMI</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {BANK_RATE_HISTORY.map((r, i) => {
+                    const prev = i > 0 ? BANK_RATE_HISTORY[i - 1].rate : null;
+                    const delta = prev === null ? null : Math.round((r.rate - prev) * 100) / 100;
+                    const current = i === BANK_RATE_HISTORY.length - 1;
+                    return (
+                      <tr key={r.from} className={`border-t border-slate-100 ${current ? 'bg-emerald-50/50' : ''}`}>
+                        <td className="py-1 px-2 text-slate-600">{fmtMY(new Date(r.from + 'T00:00:00'))}{current && <span className="ml-1 text-[9px] uppercase tracking-wide text-emerald-700 bg-emerald-100 px-1 rounded font-bold">now</span>}</td>
+                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{r.rate.toFixed(2)}%</td>
+                        <td className="py-1 px-2 text-right text-slate-600">{formatINR(r.emi, { compact: true })}</td>
+                        <td className={`py-1 px-2 text-right text-[10px] font-semibold ${delta === null ? 'text-slate-400' : delta > 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
+                          {delta === null ? 'start' : `${delta > 0 ? '+' : ''}${delta.toFixed(2)}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-1.5 leading-snug">
+              The 9.05% stretch (May 2023 – Apr 2025) is why prepaying mattered so much: at that rate the fixed EMI barely
+              dented principal, and the two early rate hikes even capitalised ₹31,439 of interest back into the balance.
+            </p>
+          </div>
+
+          <div className="bg-white rounded-lg border border-slate-200 p-3">
+            <h2 className="text-sm font-semibold flex items-center gap-1.5 mb-2">
+              <Calendar size={14} className="text-slate-400" /> Interest by Financial Year
+              <span className="text-[10px] font-normal text-slate-400">for tax (Sec 24b) · posted only</span>
+            </h2>
+            <div className="overflow-hidden rounded-md border border-slate-200">
+              <table className="w-full text-[11px]">
+                <thead className="bg-slate-50">
+                  <tr>
+                    <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Year</th>
+                    <th className="text-right py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500">Interest paid</th>
+                    <th className="text-left py-1 px-2 text-[9px] font-semibold uppercase tracking-wider text-slate-500 w-1/3"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const max = Math.max(...BANK_FY_INTEREST.map((f) => f.interest));
+                    return BANK_FY_INTEREST.map((f) => (
+                      <tr key={f.fy} className="border-t border-slate-100">
+                        <td className="py-1 px-2 text-slate-600">{f.fy}{f.partial && <span className="ml-1 text-[9px] text-slate-400">(so far)</span>}</td>
+                        <td className="py-1 px-2 text-right font-semibold text-slate-800">{formatINR(f.interest)}</td>
+                        <td className="py-1 px-2">
+                          <div className="h-1.5 rounded bg-amber-400" style={{ width: `${Math.max(3, (f.interest / max) * 100)}%` }} />
+                        </td>
+                      </tr>
+                    ));
+                  })()}
+                  <tr className="border-t border-slate-200 bg-slate-50">
+                    <td className="py-1 px-2 font-semibold text-slate-700">Total</td>
+                    <td className="py-1 px-2 text-right font-bold text-amber-700">{formatINR(ORIG.paidInterest)}</td>
+                    <td className="py-1 px-2 text-[10px] text-slate-400">exact, from the bank</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-1.5 leading-snug">
+              Interest is falling fast as the balance shrinks: the bank projects only {formatINR(674311, { compact: true })} more
+              across the remaining {ORIG.remainingTenure} EMIs — and planned prepayments cut that further.
+            </p>
           </div>
         </div>
 
