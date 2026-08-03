@@ -26,7 +26,7 @@ import {
 } from 'https://esm.sh/recharts@2.13.0?deps=react@18.3.1,react-dom@18.3.1';
 import {
   Home, RotateCcw, Plus, Trash2, TrendingDown, Calendar,
-  ChevronDown, ChevronUp, Zap, Check, Wallet, Target, Pin, Activity, Pencil, Cloud, X
+  ChevronDown, ChevronUp, Zap, Check, Wallet, Target, Pin, Activity, Pencil, Cloud, X, Download
 } from 'https://esm.sh/lucide-react@0.460.0?deps=react@18.3.1';
 
 // ============ UTILITIES ============
@@ -507,6 +507,70 @@ const Dashboard = () => {
     else if (r.kind === 'adj') { a.interest += r.interest; a.principal += r.principal; }
     return a;
   }, { emi: 0, interest: 0, principal: 0, prepay: 0 }), [fullLedger]);
+
+  // "Download PDF": render the full ledger into a clean print document and hand it to the
+  // browser's print engine (Save as PDF). Deliberately not a PDF library - the browser keeps
+  // the ₹ glyph, paginates with repeating headers, and adds nothing to the bundle.
+  const downloadLedgerPdf = () => {
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const money = (n) => esc(formatINR(n));
+    const body = fullLedger.map((r) => {
+      if (r.kind === 'disb') return `<tr class="disb"><td>—</td><td>${esc(fmtFullDate(r.date))} · Disbursed (5 tranches)</td><td class="r">${r.rate.toFixed(2)}%</td><td class="r">—</td><td class="r">—</td><td class="r">—</td><td class="r">—</td><td class="r b">${money(r.balance)}</td></tr>`;
+      if (r.kind === 'today') return `<tr class="today"><td colspan="8">TODAY · ${esc(fmtFullDate(r.date))} · balance ${money(r.balance)} — rows above are the bank record, rows below are simulated</td></tr>`;
+      if (r.kind === 'prepay') return `<tr class="prep"><td>✓</td><td>${esc(fmtFullDate(r.date))} · Prepayment</td><td class="r">${r.rate.toFixed(2)}%</td><td class="r">—</td><td class="r">—</td><td class="r">—</td><td class="r b">${money(r.prepay)}</td><td class="r b">${money(r.balance)}</td></tr>`;
+      if (r.kind === 'adj') return `<tr class="adj"><td>±</td><td>${esc(fmtFullDate(r.date))} · Rate-change interest capitalised</td><td class="r">${r.rate.toFixed(2)}%</td><td class="r">—</td><td class="r">${money(r.interest)}</td><td class="r">−${money(Math.abs(r.principal))}</td><td class="r">—</td><td class="r">${money(r.balance)}</td></tr>`;
+      return `<tr${r.posted ? '' : ' class="fut"'}><td>${r.n}${r.posted ? ' ✓' : ''}</td><td>${esc(fmtMY(r.date))}</td><td class="r">${r.rate.toFixed(2)}%</td><td class="r">${money(r.emi)}</td><td class="r">${money(r.interest)}</td><td class="r">${money(r.principal)}</td><td class="r">${r.prepay > 0 ? money(r.prepay) : '—'}</td><td class="r">${money(r.balance)}</td></tr>`;
+    }).join('');
+    // Hidden iframe, not window.open: immune to popup blockers, and the parent controls print.
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+    frame.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(frame);
+    const w = frame.contentWindow;
+    w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Loan ledger · Kotak HF-38876546</title><style>
+      @page { size: A4; margin: 14mm 10mm; }
+      * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      body { font: 10px/1.45 -apple-system, 'Segoe UI', Roboto, sans-serif; color: #1e293b; margin: 0; }
+      h1 { font-size: 15px; margin: 0 0 2px; } .sub { color: #64748b; margin: 0 0 8px; }
+      .strip { display: flex; gap: 14px; margin: 0 0 10px; padding: 6px 8px; background: #f1f5f9; border-radius: 6px; }
+      .strip div { font-size: 9px; color: #64748b; } .strip b { display: block; font-size: 12px; color: #0f172a; }
+      table { width: 100%; border-collapse: collapse; font-size: 9.5px; }
+      thead { display: table-header-group; }
+      th { text-align: left; background: #e2e8f0; padding: 3px 5px; font-size: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+      td { padding: 2.5px 5px; border-bottom: 0.5px solid #e2e8f0; }
+      .r { text-align: right; } .b { font-weight: 700; } th.r { text-align: right; }
+      tr.disb td { background: #f8fafc; font-weight: 600; }
+      tr.prep td { background: #ecfdf5; color: #065f46; }
+      tr.adj td { background: #fffbeb; color: #92400e; }
+      tr.today td { background: #eef2ff; color: #3730a3; font-weight: 700; font-size: 9px; letter-spacing: 0.03em; border-top: 1.5px solid #6366f1; border-bottom: 1.5px solid #6366f1; }
+      tr.fut td { color: #475569; background: #fafaff; }
+      tr.total td { background: #e2e8f0; font-weight: 700; border-top: 1.5px solid #94a3b8; }
+      .foot { margin-top: 8px; color: #94a3b8; font-size: 8.5px; }
+    </style></head><body>
+      <h1>Home Loan Ledger — Kotak HF-38876546</h1>
+      <p class="sub">₹1.14Cr disbursed 10 Nov 2022 · generated ${esc(fmtFullDate(today))} · rate ${annualRate}% p.a. · balance today ${money(adjusted.outstanding)}</p>
+      <div class="strip">
+        <div>Closes<b>${esc(fmtMY(optimizedEndDate))}</b></div>
+        <div>EMIs paid<b>${ORIG.monthsPaid} of ${ORIG.monthsPaid + optimized.finalMonth}</b></div>
+        <div>Prepaid (made)<b>${money(BANK_PREPAID_TOTAL)}</b></div>
+        <div>Planned prepay<b>${money(ledgerTotals.prepay - BANK_PREPAID_TOTAL)}</b></div>
+        <div>Total interest (life)<b>${money(ledgerTotals.interest)}</b></div>
+        <div>Interest already paid<b>${money(ORIG.paidInterest)}</b></div>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>Date</th><th class="r">Rate</th><th class="r">EMI</th><th class="r">Interest</th><th class="r">Principal</th><th class="r">Prepay</th><th class="r">Balance</th></tr></thead>
+        <tbody>${body}
+          <tr class="total"><td colspan="3">Whole loan · EMIs + prepayments</td><td class="r">${money(ledgerTotals.emi)}</td><td class="r">${money(ledgerTotals.interest)}</td><td class="r">${money(ledgerTotals.principal)}</td><td class="r">${money(ledgerTotals.prepay)}</td><td class="r">₹0</td></tr>
+        </tbody>
+      </table>
+      <p class="foot">Rows through ${esc(fmtFullDate(new Date(BANK_LEDGER[BANK_LEDGER.length - 1][0] + 'T00:00:00')))} are verbatim from the Kotak repayment schedule. Later rows are simulated at ${annualRate}% with the planned prepayments in the dashboard at the time of export. In the browser's print dialog, choose “Save as PDF”.</p>
+    </body></html>`);
+    w.document.close();
+    // Give the iframe a beat to lay out, print it, then clean up once the dialog closes.
+    setTimeout(() => {
+      try { w.focus(); w.print(); } finally { setTimeout(() => frame.remove(), 2000); }
+    }, 300);
+  };
 
   // Guidance: what ONE lakh prepaid right now buys you (interest saved + months cut)
   const lakhImpact = useMemo(() => {
@@ -1485,6 +1549,9 @@ const Dashboard = () => {
                 <option value="monthly">Future · monthly</option>
                 <option value="yearly">Future · yearly</option>
               </select>
+              <button onClick={downloadLedgerPdf} className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1 border border-indigo-200 rounded-sm px-1.5 py-0.5 hover:bg-indigo-50" title="Full ledger as a PDF - opens the print dialog, choose Save as PDF">
+                <Download size={11} /> PDF
+              </button>
               <button onClick={() => setShowTable(!showTable)} className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700 flex items-center gap-1">
                 {showTable ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                 {showTable ? 'Hide table' : 'Show table'}
