@@ -74,26 +74,27 @@ const fmtL = (num) => {
 };
 
 // ============ STATIC LOAN DATA ============
-// Snapshot refreshed Jun 2026: outstanding brought down to ₹49L after a prepayment.
-// This figure is the balance BEFORE the Jul 10 2026 EMI (snapshotNextDue = Jul 10).
+// Snapshot refreshed 3 Aug 2026 from the bank: outstanding ₹41L exactly, stated as of today.
+// This figure is the balance BEFORE the Aug 10 2026 EMI (snapshotNextDue = Aug 10). The ~₹7.3L
+// drop since the Jun snapshot = the Jul 10 EMI principal plus the prepayment made since.
 // Bump SNAPSHOT_VERSION whenever ORIG is refreshed from the bank: cloud-synced params
 // saved under an older version are ignored for loan figures, so a stale Gist can never
 // overwrite a corrected balance (prepayment plans still restore).
-const SNAPSHOT_VERSION = 3;
+const SNAPSHOT_VERSION = 4;
 const ORIG = {
   loanAmount: 11366000,
-  paidPrincipal: 6466000,        // = original loan − ₹49L outstanding
-  paidInterest: 2980885,         // cumulative interest paid to date (≈)
-  paidTotal: 9446885,
-  outstandingPrincipal: 4900000, // ₹49L — current balance, before the Jul EMI
-  totalTenure: 101,              // 43 paid + ~58 remaining after prepayment
-  monthsPaid: 43,
-  remainingTenure: 58,
+  paidPrincipal: 7266000,        // = original loan − ₹41L outstanding
+  paidInterest: 3013348,         // cumulative interest paid to date (≈, prev 2980885 + Jul EMI ≈32463)
+  paidTotal: 10279348,
+  outstandingPrincipal: 4100000, // ₹41L — bank balance 3 Aug 2026, before the Aug EMI
+  totalTenure: 91,               // 44 paid + ~47 remaining at current EMI
+  monthsPaid: 44,
+  remainingTenure: 47,           // 41L @ 7.95% with EMI 102,408 amortizes in ~47 months
   currentEMI: 102408,
   agreementDate: new Date(2022, 1, 17),
   firstEMIDate: new Date(2022, 11, 10),
-  maturityDate: new Date(2031, 3, 10), // ~Apr 2031 after prepayment
-  snapshotNextDue: new Date(2026, 6, 10), // Jul 10 2026 (next EMI) — keeps balance at ₹49L until then
+  maturityDate: new Date(2030, 5, 10), // ~Jun 2030: 47th EMI counted from Aug 10 2026
+  snapshotNextDue: new Date(2026, 7, 10), // Aug 10 2026 (next EMI) — keeps balance at ₹41L until then
   inferredRate: 7.95
 };
 
@@ -553,12 +554,35 @@ const Dashboard = () => {
     prepayments
   });
 
+  // A saved `outstanding` is only true on the day it was saved. Restoring it verbatim used to
+  // FREEZE the balance: EMIs deducted on the 10th were overwritten by the old figure on every
+  // load (the bug that kept the dashboard at the save-time balance). So on restore, deduct the
+  // EMIs whose due dates fell after the save — same maths as getAutoState.
+  const applyEmisSince = (value, savedAtIso) => {
+    const savedAt = new Date(savedAtIso || 0);
+    const now = new Date();
+    const monthlyRate = ORIG.inferredRate / 12 / 100;
+    let out = value;
+    let cursor = new Date(ORIG.snapshotNextDue);
+    while (cursor.getTime() <= now.getTime()) {
+      if (cursor.getTime() > savedAt.getTime() && out > 0.5) {
+        const interest = out * monthlyRate;
+        let principal = Math.min(ORIG.currentEMI - interest, out);
+        if (principal < 0) principal = 0;
+        out -= principal;
+      }
+      cursor = addMonths(cursor, 1);
+    }
+    return out;
+  };
+
   const applyData = (data) => {
     if (!data || typeof data !== 'object') return;
     if (typeof data.prepayMode === 'string') setPrepayMode(data.prepayMode);
     if (data.snapshotVersion === SNAPSHOT_VERSION) {
-      // Cloud copy is from the current snapshot era — restore everything.
-      if (typeof data.outstanding === 'number') setOutstanding(data.outstanding);
+      // Cloud copy is from the current snapshot era — restore it, then roll the balance
+      // forward past any EMI dates that have passed since it was saved.
+      if (typeof data.outstanding === 'number') setOutstanding(applyEmisSince(data.outstanding, data.savedAt));
       if (typeof data.annualRate === 'number') setAnnualRate(data.annualRate);
       if (typeof data.emi === 'number') setEmi(data.emi);
       if (typeof data.remainingMonths === 'number') setRemainingMonths(data.remainingMonths);
